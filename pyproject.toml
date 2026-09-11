@@ -1,0 +1,115 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "Async-Sharepoint"
+version = "0.1.0"
+description = "sharepoint but with httpx async requests"
+readme = "README.md"
+authors = [
+  {name = "Dean MacGregor", email = "powertrading121@gmail.com"}
+]
+maintainers = [
+  {name = "Dean MacGregor", email = "powertrading121@gmail.com"}
+]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+]
+license = {text = "MIT"}
+dependencies = [
+  "httpx",
+  "typer",
+  "rich",
+]
+requires-python = ">= 3.10"
+
+[dependency-groups]
+dev = [
+    { include-group = "lint" },
+    { include-group = "test" },
+    { include-group = "typecheck" },
+    "python-dotenv>=1.2.3",
+    "ipykernel"
+]
+lint = [
+    "ruff",
+]
+test = [
+    "coverage",
+    "pytest",
+    "pytest-asyncio",
+    "msal",
+]
+typecheck = [
+    "ty",
+]
+docs = [
+    "zensical",
+    "mkdocstrings-python",
+]
+
+[project.urls]
+bugs = "https://github.com/deanm0000/Async-Sharepoint/issues"
+changelog = "https://github.com/deanm0000/Async-Sharepoint/releases"
+documentation = "https://deanm0000.github.io/Async-Sharepoint/"
+homepage = "https://github.com/deanm0000/Async-Sharepoint"
+
+[project.scripts]
+async_sharepoint = "async_sharepoint.cli:app"
+
+[tool.ty]
+# All rules are enabled as "error" by default; no need to specify unless overriding.
+# Example override: relax a rule for the entire project (uncomment if needed).
+# rules.TY015 = "warn"  # For invalid-argument-type, warn instead of error.
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "typer.Argument",
+    "typer.Option",
+]
+
+[tool.coverage.run]
+branch = true
+parallel = true
+source = ["src/", "tests/"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 50
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "if typing.TYPE_CHECKING:",
+    "@overload",
+    "@typing.overload",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/async_sharepoint"]
+
+[tool.uv]
+package = true
+default-groups = ["dev"]
