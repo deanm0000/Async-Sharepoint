@@ -2,6 +2,13 @@
 
 These are the changes that will go out in the next release.
 
+## Changed
+
+- Replaced the Python runtime implementation with a PyO3 extension using Tokio and Reqwest.
+- Preserved the public async client method names and signatures.
+- Switched package builds from hatchling to maturin and removed the unused CLI metadata.
+- Published type information through `async_sharepoint.pyi`.
+
 ## Added
 
 Async Sharepoint started out as a project generated from [Cookiecutter PyPackage](https://github.com/audreyfeldroy/cookiecutter-pypackage) containing:

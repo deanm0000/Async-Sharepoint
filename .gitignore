@@ -9,11 +9,13 @@ __pycache__/
 # Distribution / packaging
 build/
 dist/
+target/
 eggs/
 .eggs/
 *.egg-info/
 *.egg
 MANIFEST
+target
 
 # Unit test / coverage reports
 htmlcov/
@@ -52,3 +54,5 @@ site/
 # IDE files
 # .idea/
 # .vscode/
+test_comm.py
+test_projects.py

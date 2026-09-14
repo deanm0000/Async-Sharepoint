@@ -1,6 +1,6 @@
 # Async Sharepoint
 
-sharepoint but with httpx async requests
+An async SharePoint client with a native Rust implementation exposed through PyO3.
 
 ## Getting started
 

@@ -35,8 +35,7 @@ just docs-serve
 ```
 
 This starts a local server at http://localhost:8000 with live reload. Edit
-files in `docs/` or add docstrings to your code (the API reference page is
-auto-generated). Run `just docs-build` to verify a production build.
+files in `docs/` and run `just docs-build` to verify a production build.
 
 Docs deploy automatically on push to `main` after GitHub Pages is enabled. If
 the generator did not enable it, review the visibility implications first:
@@ -79,7 +78,11 @@ Ready to contribute? Here's how to set up Async-Sharepoint for local development
    ```sh
    cd Async-Sharepoint/
    uv sync
+   uv run maturin develop --uv
    ```
+
+   Building the extension requires Rust 1.88 or newer. Rust dependencies are
+   pinned in `Cargo.lock` and Python dependencies are pinned in `uv.lock`.
 
 4. Create a branch for local development:
 
@@ -119,7 +122,7 @@ Before you submit a pull request, check that it meets these guidelines:
 
 1. The pull request should include tests.
 2. If the pull request adds functionality, the docs should be updated. Put your new functionality into a function with a docstring, and add the feature to the list in README.md.
-3. The pull request should work for Python 3.12, 3.13, and 3.14. Tests run in GitHub Actions on every pull request to the main branch, make sure that the tests pass for all supported Python versions.
+3. The pull request should pass `cargo fmt`, Clippy, Rust tests, and the Python 3.12, 3.13, and 3.14 test suite.
 
 ## Tips
 

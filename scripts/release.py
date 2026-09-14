@@ -1,12 +1,13 @@
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # ///
 """Finalize release notes, tag the current version, and create a GitHub release."""
 
 import subprocess
-import tomllib
 from pathlib import Path
 from typing import NamedTuple
+
+import tomllib
 
 CHANGELOG_DIR = Path("CHANGELOG")
 UNRELEASED_PATH = CHANGELOG_DIR / "unreleased.md"

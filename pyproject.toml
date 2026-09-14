@@ -1,11 +1,11 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
 
 [project]
 name = "Async-Sharepoint"
 version = "0.1.0"
-description = "sharepoint but with httpx async requests"
+description = "Async SharePoint client powered by Rust"
 readme = "README.md"
 authors = [
   {name = "Dean MacGregor", email = "powertrading121@gmail.com"}
@@ -16,13 +16,11 @@ maintainers = [
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
     "Typing :: Typed",
 ]
 license = {text = "MIT"}
 dependencies = [
-  "httpx",
-  "typer",
-  "rich",
 ]
 requires-python = ">= 3.10"
 
@@ -32,7 +30,8 @@ dev = [
     { include-group = "test" },
     { include-group = "typecheck" },
     "python-dotenv>=1.2.3",
-    "ipykernel"
+    "ipykernel",
+    "maturin>=1.15,<2",
 ]
 lint = [
     "ruff",
@@ -56,9 +55,6 @@ bugs = "https://github.com/deanm0000/Async-Sharepoint/issues"
 changelog = "https://github.com/deanm0000/Async-Sharepoint/releases"
 documentation = "https://deanm0000.github.io/Async-Sharepoint/"
 homepage = "https://github.com/deanm0000/Async-Sharepoint"
-
-[project.scripts]
-async_sharepoint = "async_sharepoint.cli:app"
 
 [tool.ty]
 # All rules are enabled as "error" by default; no need to specify unless overriding.
@@ -87,7 +83,7 @@ extend-immutable-calls = [
 [tool.coverage.run]
 branch = true
 parallel = true
-source = ["src/", "tests/"]
+source = ["tests/"]
 
 [tool.coverage.report]
 show_missing = true
@@ -107,8 +103,10 @@ exclude_also = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/async_sharepoint"]
+[tool.maturin]
+bindings = "pyo3"
+module-name = "async_sharepoint"
+strip = true
 
 [tool.uv]
 package = true

@@ -35,4 +35,7 @@ Once you have a copy of the source, you can install it with:
 ```sh
 cd Async-Sharepoint
 uv sync
+uv run maturin develop --uv
 ```
+
+Building from source requires Rust 1.88 or newer. Published packages currently target Linux.

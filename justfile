@@ -24,14 +24,19 @@ type-check-watch:
 
 # Apply automatic formatting and lint fixes
 fix:
+    cargo fmt
     uv run --python=3.14 ruff format .
     uv run --python=3.14 ruff check . --fix
 
-# Verify formatting, linting, types, and tests on Python 3.14 without modifying source files
+# Verify Rust and Python formatting, linting, types, and tests
 check:
+    cargo fmt --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test
     uv run --python=3.14 ruff format --check .
     uv run --python=3.14 ruff check .
     uv run --python=3.14 ty check .
+    uv run --python=3.14 maturin develop --uv
     uv run --python=3.14 pytest
 
 # Apply automatic fixes, then run the local quality gate
@@ -42,13 +47,17 @@ qa: fix-and-check
 
 # Run all the tests for all the supported Python versions
 testall:
+    uv run --python=3.12 maturin develop --uv
     uv run --python=3.12 pytest
+    uv run --python=3.13 maturin develop --uv
     uv run --python=3.13 pytest
+    uv run --python=3.14 maturin develop --uv
     uv run --python=3.14 pytest
 
 # Run all the tests, but allow for arguments to be passed
 test *ARGS:
     @echo "Running with arg: {{ARGS}}"
+    uv run --python=3.14 maturin develop --uv
     uv run --python=3.14 pytest {{ARGS}}
 
 # Run all the tests, but on failure, drop into the debugger
@@ -91,6 +100,7 @@ clean: clean-build clean-pyc clean-test
 clean-build:
 	rm -fr build/
 	rm -fr dist/
+    rm -fr target/
 	rm -fr .eggs/
 	find . -name '*.egg-info' -exec rm -fr {} +
 	find . -name '*.egg' -exec rm -f {} +

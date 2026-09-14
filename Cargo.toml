@@ -1,0 +1,33 @@
+[package]
+name = "async-sharepoint"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Async SharePoint client exposed to Python with PyO3"
+repository = "https://github.com/deanm0000/Async-Sharepoint"
+homepage = "https://github.com/deanm0000/Async-Sharepoint"
+documentation = "https://deanm0000.github.io/Async-Sharepoint/"
+exclude = ["dist/", "site/", "target/"]
+
+[lib]
+name = "async_sharepoint"
+crate-type = ["cdylib"]
+path = "rust/lib.rs"
+
+[dependencies]
+pyo3 = { version = "0.29.2", features = ["abi3-py310", "extension-module"] }
+pyo3-async-runtimes = { version = "0.29.0", features = ["tokio-runtime"] }
+percent-encoding = "2.3.2"
+pythonize = "0.29.0"
+rand = "0.10.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time"] }
+url = "2.5.8"
+uuid = { version = "1.26.1", features = ["v4"] }
+
+[profile.release]
+lto = "thin"
+strip = true
