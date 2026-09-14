@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,23 +41,121 @@ fn item_id(value: &Value) -> String {
     }
 }
 
+// SharePoint list item payloads key their id as "ID", not the "Id" used elsewhere.
+fn item_dedup_id(value: &Value) -> Option<String> {
+    let id = value.get("ID").or_else(|| value.get("Id"))?;
+    Some(match id {
+        Value::String(id) => id.clone(),
+        other => other.to_string(),
+    })
+}
+
+/// Append `data`'s "value" items to `results`, skipping ones already in `seen`.
+/// Returns (items in this page, items newly added).
+fn merge_page(results: &mut Vec<Value>, seen: &mut HashSet<String>, data: &Value) -> (usize, usize) {
+    let Some(values) = data.get("value").and_then(Value::as_array) else {
+        return (0, 0);
+    };
+    let mut added = 0;
+    for item in values {
+        let is_new = match item_dedup_id(item) {
+            Some(id) => seen.insert(id),
+            None => true,
+        };
+        if is_new {
+            results.push(item.clone());
+            added += 1;
+        }
+    }
+    (values.len(), added)
+}
+
+// Number of speculative pages guessed ahead of the real next page, per batch.
+const GUESS_COUNT: u64 = 4;
+
 async fn fetch_all(
     state: &ClientState,
     url: String,
     params: Option<Vec<(String, String)>>,
 ) -> PyResult<Vec<Value>> {
+    println!("Fetching URL: {:?}", url);
+    let data = state.get_json(&url, params.as_deref()).await?;
     let mut results = Vec::new();
-    let mut next_url = Some(url);
-    let mut next_params = params;
-    while let Some(url) = next_url {
+    let mut seen = HashSet::new();
+    let (mut n, _) = merge_page(&mut results, &mut seen, &data);
+    let mut next_url = odata::string(&data, "odata.nextLink");
+
+    while let Some(url) = next_url.take() {
+        let base_id = (n > 0).then(|| odata::skiptoken_p_id(&url)).flatten();
+
+        let Some(base_id) = base_id else {
+            // Can't guess ahead without a parseable skiptoken; fetch this one page as before.
+            println!("Fetching URL: {:?}", url);
+            let data = state.get_json(&url, None).await?;
+            let (page_len, _) = merge_page(&mut results, &mut seen, &data);
+            n = page_len;
+            next_url = odata::string(&data, "odata.nextLink");
+            continue;
+        };
+
+        let guess_urls: Vec<String> = (1..=GUESS_COUNT)
+            .map(|k| odata::with_p_id(&url, base_id + n as u64 * k))
+            .collect();
+        println!(
+            "Guessing {} pages ahead (page size {}): {:?}",
+            guess_urls.len(),
+            n,
+            guess_urls
+        );
+
         println!("Fetching URL: {:?}", url);
-        let data = state.get_json(&url, next_params.as_deref()).await?;
-        if let Some(values) = data.get("value").and_then(Value::as_array) {
-            results.extend(values.iter().cloned());
+        for guess_url in &guess_urls {
+            println!("Fetching URL: {:?}", guess_url);
         }
-        next_url = odata::string(&data, "odata.nextLink");
-        next_params = None;
+        let (real, g1, g2, g3, g4) = tokio::join!(
+            state.get_json(&url, None),
+            state.get_json(&guess_urls[0], None),
+            state.get_json(&guess_urls[1], None),
+            state.get_json(&guess_urls[2], None),
+            state.get_json(&guess_urls[3], None),
+        );
+        let pages = [real?, g1?, g2?, g3?, g4?];
+
+        let mut new_items = 0usize;
+        let mut dup_items = 0usize;
+        let mut advance = odata::string(&pages[0], "odata.nextLink");
+        let mut advance_len = 0usize;
+        for (idx, data) in pages.iter().enumerate() {
+            let (page_len, added) = merge_page(&mut results, &mut seen, data);
+            new_items += added;
+            dup_items += page_len - added;
+            if idx == 0 {
+                advance_len = page_len;
+            } else if page_len > 0 {
+                advance = odata::string(data, "odata.nextLink");
+                advance_len = page_len;
+            }
+        }
+        println!(
+            "Batch complete: {} new items, {} duplicates skipped, advancing with page size {}",
+            new_items, dup_items, advance_len
+        );
+
+        next_url = advance;
+        n = advance_len;
     }
+
+    results.sort_by(|a, b| {
+        match (item_dedup_id(a), item_dedup_id(b)) {
+            (Some(ka), Some(kb)) => match (ka.parse::<u64>(), kb.parse::<u64>()) {
+                (Ok(na), Ok(nb)) => na.cmp(&nb),
+                _ => ka.cmp(&kb),
+            },
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
     Ok(results)
 }
 

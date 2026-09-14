@@ -1,4 +1,46 @@
+use url::Url;
+
 use serde_json::Value;
+
+/// Extract the `p_ID` value from a `$skiptoken` query param, if present.
+pub fn skiptoken_p_id(url_str: &str) -> Option<u64> {
+    let url = Url::parse(url_str).ok()?;
+    let skiptoken = url.query_pairs().find(|(key, _)| key == "$skiptoken")?.1;
+    skiptoken
+        .split('&')
+        .find_map(|part| part.strip_prefix("p_ID="))?
+        .parse()
+        .ok()
+}
+
+/// Rebuild `url_str` with its `$skiptoken` `p_ID` replaced by `new_id`.
+pub fn with_p_id(url_str: &str, new_id: u64) -> String {
+    let Ok(mut url) = Url::parse(url_str) else {
+        return url_str.to_owned();
+    };
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(key, value)| {
+            if key != "$skiptoken" {
+                return (key.into_owned(), value.into_owned());
+            }
+            let new_value = value
+                .split('&')
+                .map(|part| {
+                    if part.starts_with("p_ID=") {
+                        format!("p_ID={new_id}")
+                    } else {
+                        part.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            (key.into_owned(), new_value)
+        })
+        .collect();
+    url.query_pairs_mut().clear().extend_pairs(&pairs);
+    url.to_string()
+}
 
 pub fn literal(value: &str) -> String {
     let escaped = value
@@ -61,6 +103,16 @@ mod tests {
         assert_eq!(literal("A%+#&'B"), "'A%25%2B%23%26''B'");
         assert_eq!(bool_literal(true), "true");
         assert_eq!(bool_literal(false), "false");
+    }
+
+    #[test]
+    fn parses_and_rewrites_skiptoken_p_id() {
+        let url = "https://example.com/items?%24skiptoken=Paged%3dTRUE%26p_ID%3d101";
+        assert_eq!(skiptoken_p_id(url), Some(101));
+
+        let rewritten = with_p_id(url, 201);
+        assert_eq!(skiptoken_p_id(&rewritten), Some(201));
+        assert!(rewritten.contains("Paged%3DTRUE"));
     }
 
     #[test]
