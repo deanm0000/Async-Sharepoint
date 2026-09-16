@@ -50,6 +50,9 @@ The client is an async context manager. Its public methods are:
 - `await get_items(title=None, *, id=None, caml=None, max_wait=None)`
 - `await get_file(path)`
 - `await download(path)`
+
+`path` accepts a server-relative path, an `AllItems.aspx?id=...` browser link, or a
+`Doc.aspx?sourcedoc={GUID}` browser/share link (resolved via the file's unique id).
 - `await upload(folder_path, filename, content, *, overwrite=True)`
 - `await add_folder(path, *, overwrite=False)`
 - `await get_current_user()`

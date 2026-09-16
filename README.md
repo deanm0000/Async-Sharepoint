@@ -25,6 +25,8 @@ The repository also contains a standalone Rust crate in `core/`, published as
 
 ```bash
 uv add Async-Sharepoint
+## or
+pip install Async-Sharepoint
 ```
 
 ### Rust
@@ -39,7 +41,7 @@ use async_sharepoint::{CertificateCredential, SharePointClient};
 let credential = CertificateCredential::load(
     tenant_id,
     client_id,
-    "/path/to/azure-app-private.key",
+    "/path/to/private.key",
     thumbprint,
 )?;
 let client = SharePointClient::new(site_url, &credential)?;
@@ -54,7 +56,7 @@ from async_sharepoint import CertificateCredential, SharePointClient
 credential = CertificateCredential(
     tenant_id=tenant_id,
     client_id=client_id,
-    private_key_path="/path/to/azure-app-private.key",
+    private_key_path="/path/to/private.key",
     thumbprint=thumbprint,
 )
 
@@ -72,8 +74,3 @@ Full documentation is available on
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing, and
 documentation instructions.
 
-## Author
-
-Async Sharepoint was created in 2026 by Dean MacGregor.
-
-Built with [Cookiecutter](https://github.com/cookiecutter/cookiecutter) and the [audreyfeldroy/cookiecutter-pypackage](https://github.com/audreyfeldroy/cookiecutter-pypackage) project template.

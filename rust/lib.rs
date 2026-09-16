@@ -54,6 +54,31 @@ fn browser_path(path: &str) -> PyResult<String> {
         .ok_or_else(|| PyValueError::new_err("browser URL has no id query parameter"))
 }
 
+/// Either a server-relative path or a file's unique id (e.g. from a `sourcedoc` browser link).
+enum FileLocator {
+    Path(String),
+    Id(String),
+}
+
+/// Resolve a server-relative path, an AllItems browser URL (`?id=`), or a
+/// "Doc.aspx" / OneDrive-style browser URL (`?sourcedoc={guid}`).
+fn browser_file_locator(path: &str) -> PyResult<FileLocator> {
+    if !path.starts_with("http://") && !path.starts_with("https://") {
+        return Ok(FileLocator::Path(path.to_owned()));
+    }
+    let url = url::Url::parse(path).map_err(runtime_error)?;
+    if let Some((_, value)) = url.query_pairs().find(|(key, _)| key == "sourcedoc") {
+        let id = value.trim_matches(|c| c == '{' || c == '}').to_owned();
+        return Ok(FileLocator::Id(id));
+    }
+    url.query_pairs()
+        .find(|(key, _)| key == "id")
+        .map(|(_, value)| FileLocator::Path(value.into_owned()))
+        .ok_or_else(|| {
+            PyValueError::new_err("browser URL has no id or sourcedoc query parameter")
+        })
+}
+
 fn browser_url(site_url: &str, path: &str, is_file: bool) -> PyResult<String> {
     let mut url = url::Url::parse(site_url).map_err(runtime_error)?;
     let site_path = url.path().trim_end_matches('/').to_owned();
@@ -340,6 +365,20 @@ fn properties_getattr(properties: &Py<PyDict>, py: Python<'_>, name: &str) -> Py
         .ok_or_else(|| PyAttributeError::new_err(name.to_owned()))
 }
 
+fn properties_label(properties: &Py<PyDict>, py: Python<'_>) -> PyResult<String> {
+    let dict = properties.bind(py);
+    let title = dict.get_item("Title")?;
+    let truthy_title = match &title {
+        Some(value) => value.is_truthy()?,
+        None => false,
+    };
+    let value = if truthy_title { title } else { dict.get_item("Name")? };
+    match value {
+        Some(value) => Ok(value.str()?.to_string()),
+        None => Ok("None".to_owned()),
+    }
+}
+
 fn merge_properties(py: Python<'_>, properties: &Py<PyDict>, value: &Value) -> PyResult<()> {
     if let Some(values) = value.as_object() {
         for (key, value) in values {
@@ -449,34 +488,39 @@ fn ls_awaitable<'py>(
             .get_json(&format!("{}/DefaultDocumentLibrary", state.web_url), None)
             .await
             .map_err(runtime_error)?;
+        let id = odata::string(&documents, "Id").unwrap_or_default();
+        let root_path = {
+            let root = state
+                .get_json(
+                    &format!(
+                        "{}/lists/GetById({})/RootFolder",
+                        state.web_url,
+                        odata::literal(&id)
+                    ),
+                    None,
+                )
+                .await
+                .map_err(runtime_error)?;
+            odata::string(&root, "ServerRelativeUrl").ok_or_else(|| {
+                PyRuntimeError::new_err("DefaultDocumentLibrary root has no ServerRelativeUrl")
+            })?
+        };
         let path = match path {
             Some(path) => browser_path(&path)?,
-            None => {
-                let id = odata::string(&documents, "Id").unwrap_or_default();
-                let root = state
-                    .get_json(
-                        &format!(
-                            "{}/lists/GetById({})/RootFolder",
-                            state.web_url,
-                            odata::literal(&id)
-                        ),
-                        None,
-                    )
-                    .await
-                    .map_err(runtime_error)?;
-                odata::string(&root, "ServerRelativeUrl").ok_or_else(|| {
-                    PyRuntimeError::new_err("DefaultDocumentLibrary root has no ServerRelativeUrl")
-                })?
-            }
+            None => root_path.clone(),
         };
-        let list_url = format!(
-            "{}/lists/GetById({})",
-            state.web_url,
-            odata::literal(&odata::string(&documents, "Id").unwrap_or_default())
-        );
-        let caml = format!(
-            "<View Scope=\"RecursiveAll\"><ViewFields><FieldRef Name=\"FileRef\" /><FieldRef Name=\"FileLeafRef\" /><FieldRef Name=\"FSObjType\" /><FieldRef Name=\"FileDirRef\" /></ViewFields><Query><Where><Eq><FieldRef Name=\"FileDirRef\" /><Value Type=\"Text\">{path}</Value></Eq></Where></Query><RowLimit>500</RowLimit></View>"
-        );
+        let list_url = format!("{}/lists/GetById({})", state.web_url, odata::literal(&id));
+        // SharePoint's CAML FileDirRef equality filter 500s when compared against the
+        // document library's own root folder, so scope the root via FolderServerRelativeUrl
+        // alone instead of also filtering by FileDirRef.
+        let caml = if path == root_path {
+            "<View Scope=\"Default\"><ViewFields><FieldRef Name=\"FileRef\" /><FieldRef Name=\"FileLeafRef\" /><FieldRef Name=\"FSObjType\" /><FieldRef Name=\"FileDirRef\" /></ViewFields><RowLimit>500</RowLimit></View>"
+                .to_owned()
+        } else {
+            format!(
+                "<View Scope=\"RecursiveAll\"><ViewFields><FieldRef Name=\"FileRef\" /><FieldRef Name=\"FileLeafRef\" /><FieldRef Name=\"FSObjType\" /><FieldRef Name=\"FileDirRef\" /></ViewFields><Query><Where><Eq><FieldRef Name=\"FileDirRef\" /><Value Type=\"Text\">{path}</Value></Eq></Where></Query><RowLimit>500</RowLimit></View>"
+            )
+        };
         let body = json!({"query": {"ViewXml": caml, "FolderServerRelativeUrl": path}});
         let data = match state
             .post_json(&format!("{list_url}/GetItems"), Some(&body), None)
@@ -502,6 +546,7 @@ fn ls_awaitable<'py>(
                             properties: value_dict(py, &file)?,
                             list_url: Some(list_url),
                             item_id: None,
+                            unique_id: None,
                             resolve_task: None,
                         },
                     )?;
@@ -562,6 +607,19 @@ impl SPFolder {
         properties_getattr(&self.properties, py, name)
     }
 
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let label = if self.resolved() {
+            properties_label(&self.properties, py)?
+        } else {
+            "(unresolved)".to_owned()
+        };
+        Ok(format!("SPFolder: {label}"))
+    }
+
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        self.__repr__(py)
+    }
+
     fn resolve<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             resolve_folder(&slf).await.map(|_| ())
@@ -603,6 +661,8 @@ struct SPFile {
     list_url: Option<String>,
     #[pyo3(get, set)]
     item_id: Option<String>,
+    #[pyo3(get, set)]
+    unique_id: Option<String>,
     resolve_task: Option<tokio::task::JoinHandle<PyResult<Option<String>>>>,
 }
 
@@ -629,6 +689,12 @@ fn start_file_resolution(
             state.web_url,
             odata::literal(path)
         );
+        (
+            file_url.clone(),
+            Some(format!("{file_url}/ListItemAllFields")),
+        )
+    } else if let Some(unique_id) = &file.unique_id {
+        let file_url = format!("{}/GetFileById(guid'{}')", state.web_url, unique_id);
         (
             file_url.clone(),
             Some(format!("{file_url}/ListItemAllFields")),
@@ -687,7 +753,7 @@ async fn resolve_file(file: &Py<SPFile>) -> PyResult<(Arc<ClientState>, String)>
 #[pymethods]
 impl SPFile {
     #[new]
-    #[pyo3(signature = (client, server_relative_path=None, properties=None, list_url=None, item_id=None))]
+    #[pyo3(signature = (client, server_relative_path=None, properties=None, list_url=None, item_id=None, unique_id=None))]
     fn new(
         py: Python<'_>,
         client: Py<SharePointClient>,
@@ -695,6 +761,7 @@ impl SPFile {
         properties: Option<Py<PyDict>>,
         list_url: Option<String>,
         item_id: Option<String>,
+        unique_id: Option<String>,
     ) -> PyResult<Py<Self>> {
         let file = Py::new(
             py,
@@ -704,6 +771,7 @@ impl SPFile {
                 properties: properties.unwrap_or_else(|| PyDict::new(py).unbind()),
                 list_url,
                 item_id,
+                unique_id,
                 resolve_task: None,
             },
         )?;
@@ -736,6 +804,19 @@ impl SPFile {
 
     fn __getattr__(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
         properties_getattr(&self.properties, py, name)
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let label = if self.resolved() {
+            properties_label(&self.properties, py)?
+        } else {
+            "(unresolved)".to_owned()
+        };
+        Ok(format!("SPFile:   {label}"))
+    }
+
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        self.__repr__(py)
     }
 
     fn resolve<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -926,6 +1007,7 @@ fn item_from_value(
             properties,
             list_url: Some(list_url),
             item_id: Some(id),
+            unique_id: None,
             resolve_task: None,
         },
     )?;
@@ -1247,15 +1329,20 @@ impl SharePointClient {
     }
 
     fn get_file<'py>(slf: Py<Self>, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
-        let path = browser_path(&path)?;
+        let locator = browser_file_locator(&path)?;
+        let (server_relative_path, unique_id) = match locator {
+            FileLocator::Path(path) => (Some(path), None),
+            FileLocator::Id(id) => (None, Some(id)),
+        };
         let file = Py::new(
             py,
             SPFile {
                 client: slf,
-                server_relative_path: Some(path.clone()),
+                server_relative_path,
                 properties: PyDict::new(py).unbind(),
                 list_url: None,
                 item_id: None,
+                unique_id,
                 resolve_task: None,
             },
         )?;
@@ -1276,13 +1363,18 @@ impl SharePointClient {
 
     fn download<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&self.state);
-        let path = browser_path(&path)?;
+        let locator = browser_file_locator(&path)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let url = format!(
-                "{}/GetFileByServerRelativePath(DecodedUrl={})/$value",
-                state.web_url,
-                odata::literal(&path)
-            );
+            let url = match locator {
+                FileLocator::Path(path) => format!(
+                    "{}/GetFileByServerRelativePath(DecodedUrl={})/$value",
+                    state.web_url,
+                    odata::literal(&path)
+                ),
+                FileLocator::Id(id) => {
+                    format!("{}/GetFileById(guid'{}')/$value", state.web_url, id)
+                }
+            };
             let content = state.get_bytes(&url).await?;
             Python::attach(|py| Ok(PyBytes::new(py, &content).unbind()))
         })
@@ -1375,6 +1467,7 @@ impl SharePointClient {
                         properties: value_dict(py, &data)?,
                         list_url: None,
                         item_id: None,
+                        unique_id: None,
                         resolve_task: None,
                     },
                 )?;

@@ -19,6 +19,17 @@ These are the changes that will go out in the next release.
 
 - `CertificateCredential` for the Entra ID certificate client-credentials flow.
 - `SharePointClient.from_static_token()` for wrapping a token you already hold.
+- `get_file()` and `download()` now also accept `Doc.aspx?sourcedoc={GUID}` browser/share links,
+  resolved via the file's unique id (`SPFile.unique_id`).
+- `SPFile`/`SPFolder` now have `__repr__`/`__str__` showing `"Title"` or `"Name"` from
+  `properties`, padded so names line up when printing a mixed list of files and folders.
+  Shows `(unresolved)` instead of `None` when `resolved` is still `False`.
+
+## Fixed
+
+- `ls()` on a document library's root folder no longer 500s/404s. SharePoint's CAML
+  `FileDirRef` equality filter fails when compared against the library's own root, so the
+  root folder is now listed via `FolderServerRelativeUrl` scoping alone.
 
 Async Sharepoint started out as a project generated from [Cookiecutter PyPackage](https://github.com/audreyfeldroy/cookiecutter-pypackage) containing:
 

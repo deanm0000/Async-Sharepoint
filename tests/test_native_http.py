@@ -59,6 +59,16 @@ class SharePointHandler(BaseHTTPRequestHandler):
                     "Name": server_relative_url.rsplit("/", 1)[-1],
                 }
             )
+        elif "/GetFileById(" in path and not path.endswith("/$value"):
+            self.send_json(
+                {
+                    "ServerRelativeUrl": "/sites/team/Documents/report.txt",
+                    "ServerRedirectedEmbedUri": (
+                        f"{self.base_url}/sites/team/Documents/report.txt?action=interactive"
+                    ),
+                    "Name": "report.txt",
+                }
+            )
         elif "/lists/GetByTitle('Documents')/items" in path or "/lists/GetById('list-1')/items" in path:
             self.send_json(
                 {
@@ -186,6 +196,15 @@ async def test_native_sharepoint_operations() -> None:
             assert relative_path is not None
             assert relative_path.endswith("report.txt")
             assert await client.download(browser_file_url) == b"report-content"
+
+            sourcedoc_url = (
+                f"{site_url}/_layouts/15/Doc.aspx?sourcedoc=%7B01246A4B-84D7-49D6-8937-895D3C0F50A9%7D"
+                "&file=report.txt&action=edit"
+            )
+            sourcedoc_file = await client.get_file(sourcedoc_url)
+            assert sourcedoc_file.unique_id == "01246A4B-84D7-49D6-8937-895D3C0F50A9"
+            assert sourcedoc_file.server_relative_path == "/sites/team/Documents/report.txt"
+            assert await client.download(sourcedoc_url) == b"report-content"
 
             listed = await client.ls("/sites/team/Documents/Folder")
             assert isinstance(listed[0], SPFolder)
