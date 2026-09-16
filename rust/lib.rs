@@ -368,9 +368,10 @@ struct SPFolder {
 impl Drop for SPFolder {
     fn drop(&mut self) {
         if let Some(handle) = self.resolve_task.take()
-            && !handle.is_finished() {
-                handle.abort();
-            }
+            && !handle.is_finished()
+        {
+            handle.abort();
+        }
     }
 }
 
@@ -608,9 +609,10 @@ struct SPFile {
 impl Drop for SPFile {
     fn drop(&mut self) {
         if let Some(handle) = self.resolve_task.take()
-            && !handle.is_finished() {
-                handle.abort();
-            }
+            && !handle.is_finished()
+        {
+            handle.abort();
+        }
     }
 }
 

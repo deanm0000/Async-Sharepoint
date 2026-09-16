@@ -182,7 +182,9 @@ async def test_native_sharepoint_operations() -> None:
             assert await file.download() == b"report-content"
 
             browser_file_url = f"{site_url}/Documents/Forms/AllItems.aspx?id=%2Fsites%2Fteam%2FDocuments%2Freport.txt"
-            assert (await client.get_file(browser_file_url)).server_relative_path.endswith("report.txt")
+            relative_path = (await client.get_file(browser_file_url)).server_relative_path
+            assert relative_path is not None
+            assert relative_path.endswith("report.txt")
             assert await client.download(browser_file_url) == b"report-content"
 
             listed = await client.ls("/sites/team/Documents/Folder")
