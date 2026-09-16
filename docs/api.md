@@ -3,18 +3,44 @@
 The implementation is a native PyO3 extension. Type annotations are shipped in
 `async_sharepoint.pyi`.
 
+## CertificateCredential
+
+```python
+CertificateCredential(
+  *,
+  tenant_id,
+  client_id,
+  private_key_path,
+  thumbprint,
+)
+```
+
+Entra ID certificate credentials. The private key and thumbprint are parsed on construction, so
+malformed input raises immediately. Read-only attributes: `tenant_id`, `client_id`.
+
 ## SharePointClient
 
 ```python
 SharePointClient(
   site_url,
-  get_token,
+  credential,
+  *,
+  properties=None,
+  item_id=None,
+  list_url=None,
+)
+
+SharePointClient.from_static_token(
+  site_url,
+  token,
   *,
   properties=None,
   item_id=None,
   list_url=None,
 )
 ```
+
+`from_static_token` wraps a token you already hold; it is never refreshed.
 
 The client is an async context manager. Its public methods are:
 

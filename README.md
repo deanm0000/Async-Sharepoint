@@ -5,6 +5,9 @@
 
 An async SharePoint client with a native Rust implementation exposed through PyO3.
 
+The repository also contains a standalone Rust crate in `core/`, published as
+`async-sharepoint`, for Rust projects that do not need Python bindings.
+
 * [GitHub](https://github.com/deanm0000/Async-Sharepoint/) | [PyPI](https://pypi.org/project/Async-Sharepoint/) | [Documentation](https://deanm0000.github.io/Async-Sharepoint/)
 * Created by [Dean MacGregor](na) | GitHub [@deanm0000](https://github.com/deanm0000) | PyPI [@deanm0000](https://pypi.org/user/deanm0000/)
 * MIT License
@@ -12,6 +15,7 @@ An async SharePoint client with a native Rust implementation exposed through PyO
 ## Features
 
 * Async list, item, file, folder, permission, and search operations
+* Native Entra ID certificate authentication with background token refresh
 * Automatic token caching and refresh
 * Retry handling for throttling and transient SharePoint failures
 * Paginated queries and chunked uploads
@@ -23,12 +27,38 @@ An async SharePoint client with a native Rust implementation exposed through PyO
 uv add Async-Sharepoint
 ```
 
+### Rust
+
+```bash
+cargo add async-sharepoint
+```
+
+```rust
+use async_sharepoint::{CertificateCredential, SharePointClient};
+
+let credential = CertificateCredential::load(
+    tenant_id,
+    client_id,
+    "/path/to/azure-app-private.key",
+    thumbprint,
+)?;
+let client = SharePointClient::new(site_url, &credential)?;
+let files = client.ls(None).await?;
+```
+
 ## Usage
 
 ```python
-from async_sharepoint import SharePointClient
+from async_sharepoint import CertificateCredential, SharePointClient
 
-async with SharePointClient(site_url, get_token) as client:
+credential = CertificateCredential(
+    tenant_id=tenant_id,
+    client_id=client_id,
+    private_key_path="/path/to/azure-app-private.key",
+    thumbprint=thumbprint,
+)
+
+async with SharePointClient(site_url, credential) as client:
     documents = await client.get_items("Documents")
 ```
 

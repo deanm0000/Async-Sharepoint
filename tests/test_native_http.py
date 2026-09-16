@@ -106,8 +106,22 @@ class SharePointHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path, body = self.record()
         if path.endswith("/GetItems"):
-            assert json.loads(body)["query"]["ViewXml"] == "<View />"
-            self.send_json({"value": []})
+            view_xml = json.loads(body)["query"]["ViewXml"]
+            if view_xml == "<View />":
+                self.send_json({"value": []})
+            else:
+                self.send_json(
+                    {
+                        "value": [
+                            {
+                                "Id": 1,
+                                "FileSystemObjectType": 1,
+                                "ServerRelativeUrl": "/sites/team/Documents/Folder",
+                            },
+                            {"Id": 2, "FileSystemObjectType": 0, "Title": "report.txt"},
+                        ]
+                    }
+                )
         elif "/Files/add(" in path:
             self.send_json({"ServerRelativeUrl": "/sites/team/Documents/upload.txt"})
         elif "/startUpload(" in path or "/continueUpload(" in path:
@@ -139,15 +153,8 @@ def sharepoint_server() -> Iterator[str]:
 
 @pytest.mark.asyncio
 async def test_native_sharepoint_operations() -> None:
-    token_calls = 0
-
-    def get_token() -> dict:
-        nonlocal token_calls
-        token_calls += 1
-        return {"access_token": "test-token", "expires_in": 3600}
-
     with sharepoint_server() as site_url:
-        async with SharePointClient(site_url, get_token) as client:
+        async with SharePointClient.from_static_token(site_url, "test-token") as client:
             initial_lists, remaining = await client.get(max_wait=-1)
             assert [item.title for item in initial_lists] == ["Documents"]
             assert [item.title for item in await remaining] == ["Archive"]
@@ -169,7 +176,26 @@ async def test_native_sharepoint_operations() -> None:
             assert file.properties["ServerRelativeUrl"] == "/sites/team/Documents/report.txt"
             assert file.properties["Name"] == "report.txt"
             assert "action=default" in file.get_url()
+            assert file.browser_url().endswith(
+                "Documents/Forms/AllItems.aspx?id=%2Fsites%2Fteam%2FDocuments%2Freport.txt&parent=%2Fsites%2Fteam%2FDocuments"
+            )
             assert await file.download() == b"report-content"
+
+            browser_file_url = (
+                f"{site_url}/Documents/Forms/AllItems.aspx?"
+                "id=%2Fsites%2Fteam%2FDocuments%2Freport.txt"
+            )
+            assert (await client.get_file(browser_file_url)).server_relative_path.endswith("report.txt")
+            assert await client.download(browser_file_url) == b"report-content"
+
+            listed = await client.ls("/sites/team/Documents/Folder")
+            assert isinstance(listed[0], SPFolder)
+            assert isinstance(listed[1], SPFile)
+            assert len(await listed[0].ls()) == 2
+            assert (await client.get("Documents")).get_url().endswith("Documents/Forms/AllItems.aspx")
+            assert listed[0].get_url().endswith(
+                "Documents/Forms/AllItems.aspx?id=%2Fsites%2Fteam%2FDocuments%2FFolder"
+            )
 
             caml_items, caml_remaining = await client.get_items("Documents", caml="<View />", max_wait=0)
             assert caml_items == []
@@ -191,5 +217,3 @@ async def test_native_sharepoint_operations() -> None:
             assert (await client.get_current_user())["LoginName"] == "user@example.test"
             assert (await client.get_effective_permissions("/sites/team/Documents"))["High"] == "16"
             assert (await client.search("quarterly", title="Documents"))[0]["Title"] == "Quarterly report"
-
-    assert token_calls == 1

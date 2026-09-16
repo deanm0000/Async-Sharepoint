@@ -1,18 +1,20 @@
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::Instant;
-
+use async_sharepoint_core::odata;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PyTuple};
 use pyo3_async_runtimes::TaskLocals;
 use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
+use std::env;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::task::{AbortHandle, JoinSet};
 
 mod auth;
 mod http;
-mod odata;
 
+use crate::auth::CertificateCredential;
 use crate::http::{ClientState, runtime_error};
 
 const UPLOAD_CHUNK_SIZE: usize = 4 * 1024 * 1024;
@@ -41,6 +43,41 @@ fn item_id(value: &Value) -> String {
     }
 }
 
+fn browser_path(path: &str) -> PyResult<String> {
+    if !path.starts_with("http://") && !path.starts_with("https://") {
+        return Ok(path.to_owned());
+    }
+    let url = url::Url::parse(path).map_err(runtime_error)?;
+    url.query_pairs()
+        .find(|(key, _)| key == "id")
+        .map(|(_, value)| value.into_owned())
+        .ok_or_else(|| PyValueError::new_err("browser URL has no id query parameter"))
+}
+
+fn browser_url(site_url: &str, path: &str, is_file: bool) -> PyResult<String> {
+    let mut url = url::Url::parse(site_url).map_err(runtime_error)?;
+    let site_path = url.path().trim_end_matches('/').to_owned();
+    let relative = path
+        .strip_prefix(&site_path)
+        .unwrap_or(path)
+        .trim_start_matches('/');
+    let library = relative
+        .split('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .ok_or_else(|| PyRuntimeError::new_err("path is not inside this SharePoint site"))?;
+    url.set_path(&format!("{site_path}/{library}/Forms/AllItems.aspx"));
+    if path != format!("{site_path}/{library}") && path != format!("{site_path}/{library}/") {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("id", path);
+        if is_file {
+            let parent = path.rsplit_once('/').map_or(path, |(parent, _)| parent);
+            pairs.append_pair("parent", parent);
+        }
+    }
+    Ok(url.into())
+}
+
 // SharePoint list item payloads key their id as "ID", not the "Id" used elsewhere.
 fn item_dedup_id(value: &Value) -> Option<String> {
     let id = value.get("ID").or_else(|| value.get("Id"))?;
@@ -52,7 +89,11 @@ fn item_dedup_id(value: &Value) -> Option<String> {
 
 /// Append `data`'s "value" items to `results`, skipping ones already in `seen`.
 /// Returns (items in this page, items newly added).
-fn merge_page(results: &mut Vec<Value>, seen: &mut HashSet<String>, data: &Value) -> (usize, usize) {
+fn merge_page(
+    results: &mut Vec<Value>,
+    seen: &mut HashSet<String>,
+    data: &Value,
+) -> (usize, usize) {
     let Some(values) = data.get("value").and_then(Value::as_array) else {
         return (0, 0);
     };
@@ -70,27 +111,70 @@ fn merge_page(results: &mut Vec<Value>, seen: &mut HashSet<String>, data: &Value
     (values.len(), added)
 }
 
-// Number of speculative pages guessed ahead of the real next page, per batch.
-const GUESS_COUNT: u64 = 4;
+// A guess's actual next id beyond this multiple of its expected next id triggers a regroup.
+const REDUNDANCY_THRESHOLD: f64 = 1.5;
+
+struct GuessOutcome {
+    guess_id: u64,
+    expected_next: u64,
+    data: Value,
+    next_id: Option<u64>,
+    next_url: Option<String>,
+}
+
+async fn fetch_guess(
+    state: Arc<ClientState>,
+    url: String,
+    guess_id: u64,
+    expected_next: u64,
+) -> PyResult<GuessOutcome> {
+    let data = state.get_json(&url, None).await?;
+    let next_url = odata::string(&data, "odata.nextLink");
+    let next_id = next_url.as_deref().and_then(odata::skiptoken_p_id);
+    Ok(GuessOutcome {
+        guess_id,
+        expected_next,
+        data,
+        next_id,
+        next_url,
+    })
+}
+
+fn batch_min_max(data: &Value) -> (Option<u64>, Option<u64>) {
+    let Some(values) = data.get("value").and_then(Value::as_array) else {
+        return (None, None);
+    };
+    values
+        .iter()
+        .filter_map(|item| item_dedup_id(item)?.parse::<u64>().ok())
+        .fold(
+            (None, None),
+            |(min, max): (Option<u64>, Option<u64>), id| {
+                (
+                    Some(min.map_or(id, |m| m.min(id))),
+                    Some(max.map_or(id, |m| m.max(id))),
+                )
+            },
+        )
+}
 
 async fn fetch_all(
-    state: &ClientState,
+    state: Arc<ClientState>,
     url: String,
     params: Option<Vec<(String, String)>>,
 ) -> PyResult<Vec<Value>> {
-    println!("Fetching URL: {:?}", url);
     let data = state.get_json(&url, params.as_deref()).await?;
     let mut results = Vec::new();
     let mut seen = HashSet::new();
     let (mut n, _) = merge_page(&mut results, &mut seen, &data);
     let mut next_url = odata::string(&data, "odata.nextLink");
-
+    let max_guesses = env::var("MAX_GUESSES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(20);
+    // Fall back to plain sequential fetching until we can parse a skiptoken to guess ahead from.
     while let Some(url) = next_url.take() {
-        let base_id = (n > 0).then(|| odata::skiptoken_p_id(&url)).flatten();
-
-        let Some(base_id) = base_id else {
-            // Can't guess ahead without a parseable skiptoken; fetch this one page as before.
-            println!("Fetching URL: {:?}", url);
+        let Some(base_id) = (n > 0).then(|| odata::skiptoken_p_id(&url)).flatten() else {
             let data = state.get_json(&url, None).await?;
             let (page_len, _) = merge_page(&mut results, &mut seen, &data);
             n = page_len;
@@ -98,63 +182,126 @@ async fn fetch_all(
             continue;
         };
 
-        let guess_urls: Vec<String> = (1..=GUESS_COUNT)
-            .map(|k| odata::with_p_id(&url, base_id + n as u64 * k))
-            .collect();
-        println!(
-            "Guessing {} pages ahead (page size {}): {:?}",
-            guess_urls.len(),
-            n,
-            guess_urls
-        );
+        // Continuously fetch the real chain plus speculative guesses ahead of it, capped at
+        // GUESS_COUNT concurrent requests, until this pagination chain is exhausted.
+        let mut frontier_id = base_id;
+        let mut frontier_n = n as u64;
+        let mut template = url;
+        let mut next_offset: u64 = 0;
+        let mut dispatched_max = frontier_id;
+        let mut terminal_at: Option<u64> = None;
+        // let mut paused_awaiting: Option<u64> = None;
+        // let mut paused_awaitings: HashSet<u64> = HashSet::new();
+        let mut tasks: JoinSet<PyResult<GuessOutcome>> = JoinSet::new();
+        let mut abort_handles: HashMap<u64, AbortHandle> = HashMap::new();
 
-        println!("Fetching URL: {:?}", url);
-        for guess_url in &guess_urls {
-            println!("Fetching URL: {:?}", guess_url);
-        }
-        let (real, g1, g2, g3, g4) = tokio::join!(
-            state.get_json(&url, None),
-            state.get_json(&guess_urls[0], None),
-            state.get_json(&guess_urls[1], None),
-            state.get_json(&guess_urls[2], None),
-            state.get_json(&guess_urls[3], None),
-        );
-        let pages = [real?, g1?, g2?, g3?, g4?];
+        loop {
+            while tasks.len() <= max_guesses
+                && terminal_at.map_or(true, |t| frontier_id + frontier_n * next_offset <= t)
+            {
+                let guess_id = frontier_id + frontier_n * next_offset;
+                let guess_url = odata::with_p_id(&template, guess_id);
+                let expected_next = guess_id + frontier_n;
+                let handle = tasks.spawn(fetch_guess(
+                    Arc::clone(&state),
+                    guess_url,
+                    guess_id,
+                    expected_next,
+                ));
+                abort_handles.insert(guess_id, handle);
+                dispatched_max = dispatched_max.max(guess_id);
+                next_offset += 1;
+            }
 
-        let mut new_items = 0usize;
-        let mut dup_items = 0usize;
-        let mut advance = odata::string(&pages[0], "odata.nextLink");
-        let mut advance_len = 0usize;
-        for (idx, data) in pages.iter().enumerate() {
-            let (page_len, added) = merge_page(&mut results, &mut seen, data);
-            new_items += added;
-            dup_items += page_len - added;
-            if idx == 0 {
-                advance_len = page_len;
-            } else if page_len > 0 {
-                advance = odata::string(data, "odata.nextLink");
-                advance_len = page_len;
+            let Some(joined) = tasks.join_next().await else {
+                break;
+            };
+            let outcome = match joined {
+                Ok(outcome) => outcome?,
+                Err(join_err) if join_err.is_cancelled() => continue,
+                Err(join_err) => return Err(runtime_error(join_err)),
+            };
+            abort_handles.remove(&outcome.guess_id);
+
+            let (page_len, unique_added) = merge_page(&mut results, &mut seen, &outcome.data);
+            let (min_id, max_id) = batch_min_max(&outcome.data);
+            // println!(
+            //     "Guess id={} -> next_url id={:?}, batch min={:?} max={:?}, records={}, unique_added={}",
+            //     outcome.guess_id, outcome.next_id, min_id, max_id, page_len, unique_added
+            // );
+
+            match outcome.next_id {
+                Some(next_id) => {
+                    // A small overshoot past the next guess id is normal (ids aren't evenly
+                    // spaced) and does NOT mean that guess is redundant; only an anomalously
+                    // large jump means this page's range already swallowed other guesses.
+                    let expected_next_threshold =
+                        outcome.expected_next as f64 + frontier_n as f64 * REDUNDANCY_THRESHOLD;
+                    if (next_id as f64) > expected_next_threshold {
+                        // Never cancel the guess we're waiting to regroup on.
+                        let redundant: Vec<u64> = abort_handles
+                            .keys()
+                            .copied()
+                            .filter(|id| *id < next_id - frontier_n && *id > outcome.guess_id)
+                            .collect();
+                        // println!(
+                        //     "Found next_id {} is greater than {}. Redundant guess ids to abort: {:?}",
+                        //     next_id, expected_next_threshold, redundant
+                        // );
+                        for id in redundant {
+                            if let Some(handle) = abort_handles.remove(&id) {
+                                handle.abort();
+                            }
+                        }
+
+                        frontier_id = next_id;
+                        frontier_n = page_len.max(1) as u64;
+                        template = outcome.next_url.clone().unwrap_or(template);
+                        next_offset = 0;
+                    }
+
+                    // if paused_awaitings.contains(&outcome.guess_id) {
+                    //     paused_awaitings.remove(&outcome.guess_id);
+                    //     frontier_id = next_id;
+                    //     frontier_n = page_len.max(1) as u64;
+                    //     template = outcome.next_url.clone().unwrap_or(template);
+                    //     next_offset = 0;
+                    // }
+                }
+                None => {
+                    // Nothing exists past this id; drop any guesses further out than it, but
+                    // never the one we're waiting to regroup on.
+                    let boundary =
+                        terminal_at.map_or(outcome.guess_id, |t| t.min(outcome.guess_id));
+                    terminal_at = Some(boundary);
+
+                    let redundant: Vec<u64> = abort_handles
+                        .keys()
+                        .copied()
+                        .filter(|id| *id > boundary)
+                        .collect();
+                    // println!(
+                    //     "Setting terminal boundary at {}. Cancelling redundant guesses. {:?}",
+                    //     boundary, redundant
+                    // );
+                    for id in redundant {
+                        if let Some(handle) = abort_handles.remove(&id) {
+                            handle.abort();
+                        }
+                    }
+                }
             }
         }
-        println!(
-            "Batch complete: {} new items, {} duplicates skipped, advancing with page size {}",
-            new_items, dup_items, advance_len
-        );
-
-        next_url = advance;
-        n = advance_len;
     }
 
-    results.sort_by(|a, b| {
-        match (item_dedup_id(a), item_dedup_id(b)) {
-            (Some(ka), Some(kb)) => match (ka.parse::<u64>(), kb.parse::<u64>()) {
-                (Ok(na), Ok(nb)) => na.cmp(&nb),
-                _ => ka.cmp(&kb),
-            },
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }
+    results.sort_by(|a, b| match (item_dedup_id(a), item_dedup_id(b)) {
+        (Some(ka), Some(kb)) => match (ka.parse::<u64>(), kb.parse::<u64>()) {
+            (Ok(na), Ok(nb)) => na.cmp(&nb),
+            _ => ka.cmp(&kb),
+        },
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
     });
     Ok(results)
 }
@@ -173,7 +320,6 @@ async fn fetch_deferred(
         .cloned()
         .unwrap_or_default();
     let mut next_url = odata::string(&data, "odata.nextLink");
-    println!("Initial next_url: {:?}", next_url);
     while next_url.is_some() && start.elapsed().as_secs_f64() <= max_wait {
         let data = state
             .get_json(next_url.as_deref().expect("next URL checked above"), None)
@@ -182,7 +328,6 @@ async fn fetch_deferred(
             results.extend(values.iter().cloned());
         }
         next_url = odata::string(&data, "odata.nextLink");
-        println!("Next next_url: {:?}", next_url);
     }
     Ok((results, next_url))
 }
@@ -217,6 +362,161 @@ struct SPFolder {
     list_url: Option<String>,
     #[pyo3(get, set)]
     item_id: Option<String>,
+    resolve_task: Option<tokio::task::JoinHandle<PyResult<Option<String>>>>,
+}
+
+impl Drop for SPFolder {
+    fn drop(&mut self) {
+        if let Some(handle) = self.resolve_task.take() {
+            if !handle.is_finished() {
+                handle.abort();
+            }
+        }
+    }
+}
+
+fn start_folder_resolution(
+    py: Python<'_>,
+    folder: &Py<SPFolder>,
+) -> PyResult<tokio::task::JoinHandle<PyResult<Option<String>>>> {
+    let folder = folder.bind(py).borrow();
+    let client = folder
+        .client
+        .as_ref()
+        .ok_or_else(|| PyRuntimeError::new_err("folder has no client"))?;
+    let state = Arc::clone(&client.bind(py).borrow().state);
+    let properties = folder.properties.clone_ref(py);
+    let folder_url = if let Some(path) = &folder.server_relative_url {
+        format!(
+            "{}/GetFolderByServerRelativeUrl({})",
+            state.web_url,
+            odata::literal(path)
+        )
+    } else {
+        format!(
+            "{}/items({})/Folder",
+            folder
+                .list_url
+                .as_deref()
+                .ok_or_else(|| PyRuntimeError::new_err("folder has no list_url"))?,
+            folder
+                .item_id
+                .as_deref()
+                .ok_or_else(|| PyRuntimeError::new_err("folder has no item_id"))?
+        )
+    };
+    Ok(pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+        let folder_data = state.get_json(&folder_url, None).await?;
+        let path = odata::string(&folder_data, "ServerRelativeUrl");
+        Python::attach(|py| merge_properties(py, &properties, &folder_data))?;
+        Ok(path)
+    }))
+}
+
+async fn resolve_folder(folder: &Py<SPFolder>) -> PyResult<(Arc<ClientState>, String)> {
+    let (state, task) = Python::attach(|py| {
+        let mut folder = folder.bind(py).borrow_mut();
+        let client = folder
+            .client
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("folder has no client"))?;
+        let state = Arc::clone(&client.bind(py).borrow().state);
+        Ok::<_, PyErr>((state, folder.resolve_task.take()))
+    })?;
+    if let Some(task) = task {
+        let resolved_path = task.await.map_err(runtime_error)??;
+        Python::attach(|py| {
+            let mut folder = folder.bind(py).borrow_mut();
+            if resolved_path.is_some() {
+                folder.server_relative_url = resolved_path;
+            }
+        });
+    }
+    let path = Python::attach(|py| folder.bind(py).borrow().server_relative_url.clone());
+    path.map(|path| (state, path)).ok_or_else(|| {
+        PyRuntimeError::new_err("folder has no server_relative_url even after resolving")
+    })
+}
+
+fn ls_awaitable<'py>(
+    py: Python<'py>,
+    client: Py<SharePointClient>,
+    path: Option<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let state = Arc::clone(&client.bind(py).borrow().state);
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let documents = state
+            .get_json(&format!("{}/DefaultDocumentLibrary", state.web_url), None)
+            .await
+            .map_err(runtime_error)?;
+        let path = match path {
+            Some(path) => browser_path(&path)?,
+            None => {
+                let id = odata::string(&documents, "Id").unwrap_or_default();
+                let root = state
+                    .get_json(
+                        &format!(
+                            "{}/lists/GetById({})/RootFolder",
+                            state.web_url,
+                            odata::literal(&id)
+                        ),
+                        None,
+                    )
+                    .await
+                    .map_err(runtime_error)?;
+                odata::string(&root, "ServerRelativeUrl").ok_or_else(|| {
+                    PyRuntimeError::new_err("DefaultDocumentLibrary root has no ServerRelativeUrl")
+                })?
+            }
+        };
+        let list_url = format!(
+            "{}/lists/GetById({})",
+            state.web_url,
+            odata::literal(&odata::string(&documents, "Id").unwrap_or_default())
+        );
+        let caml = format!(
+            "<View Scope=\"RecursiveAll\"><ViewFields><FieldRef Name=\"FileRef\" /><FieldRef Name=\"FileLeafRef\" /><FieldRef Name=\"FSObjType\" /><FieldRef Name=\"FileDirRef\" /></ViewFields><Query><Where><Eq><FieldRef Name=\"FileDirRef\" /><Value Type=\"Text\">{path}</Value></Eq></Where></Query><RowLimit>500</RowLimit></View>"
+        );
+        let body = json!({"query": {"ViewXml": caml, "FolderServerRelativeUrl": path}});
+        let data = match state
+            .post_json(&format!("{list_url}/GetItems"), Some(&body), None)
+            .await
+        {
+            Ok(data) => data,
+            Err(error) if error.to_string().contains(" 500 ") => {
+                let file_url = format!(
+                    "{}/GetFileByServerRelativePath(DecodedUrl={})",
+                    state.web_url,
+                    odata::literal(&path)
+                );
+                let file = state
+                    .get_json(&file_url, None)
+                    .await
+                    .map_err(runtime_error)?;
+                return Python::attach(|py| {
+                    let file = Py::new(
+                        py,
+                        SPFile {
+                            client,
+                            server_relative_path: odata::string(&file, "ServerRelativeUrl"),
+                            properties: value_dict(py, &file)?,
+                            list_url: Some(list_url),
+                            item_id: None,
+                            resolve_task: None,
+                        },
+                    )?;
+                    Ok(PyList::new(py, [file])?.unbind())
+                });
+            }
+            Err(error) => return Err(runtime_error(error)),
+        };
+        let values = data
+            .get("value")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Python::attach(|py| items_list(py, &client, &list_url, &values))
+    })
 }
 
 #[pymethods]
@@ -237,7 +537,15 @@ impl SPFolder {
             properties: properties.unwrap_or_else(|| PyDict::new(py).unbind()),
             list_url,
             item_id,
+            resolve_task: None,
         }
+    }
+
+    #[getter]
+    fn resolved(&self) -> bool {
+        self.resolve_task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
     }
 
     #[getter]
@@ -252,6 +560,36 @@ impl SPFolder {
 
     fn __getattr__(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
         properties_getattr(&self.properties, py, name)
+    }
+
+    fn resolve<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            resolve_folder(&slf).await.map(|_| ())
+        })
+    }
+
+    fn ls<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let path = slf.bind(py).borrow().server_relative_url.clone();
+        let client = slf
+            .bind(py)
+            .borrow()
+            .client
+            .as_ref()
+            .map(|client| client.clone_ref(py))
+            .ok_or_else(|| PyRuntimeError::new_err("folder has no client"))?;
+        ls_awaitable(py, client, path)
+    }
+
+    fn get_url(&self, py: Python<'_>) -> PyResult<String> {
+        let path = self
+            .server_relative_url
+            .as_deref()
+            .ok_or_else(|| PyRuntimeError::new_err("folder has no server_relative_url"))?;
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("folder has no client"))?;
+        browser_url(&client.bind(py).borrow().state.site_url, path, false)
     }
 }
 
@@ -446,6 +784,13 @@ impl SPFile {
         parsed.query_pairs_mut().clear().extend_pairs(pairs);
         Ok(parsed.into())
     }
+
+    fn browser_url(&self, py: Python<'_>) -> PyResult<String> {
+        let path = self.server_relative_path.as_deref().ok_or_else(|| {
+            PyRuntimeError::new_err("file has no server_relative_path even after resolving")
+        })?;
+        browser_url(&self.client.bind(py).borrow().state.site_url, path, true)
+    }
 }
 
 #[pyclass(module = "async_sharepoint")]
@@ -479,11 +824,12 @@ impl SPList {
         properties_getattr(&self.properties, py, name)
     }
 
-    #[pyo3(signature = (*, caml=None, max_wait=None))]
+    #[pyo3(signature = (*, caml=None, folder_path=None, max_wait=None))]
     fn get_items<'py>(
         &self,
         py: Python<'py>,
         caml: Option<String>,
+        folder_path: Option<String>,
         max_wait: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         get_items_awaitable(
@@ -492,8 +838,20 @@ impl SPList {
             None,
             Some(self.id.clone()),
             caml,
+            folder_path,
             max_wait,
         )
+    }
+
+    fn get_url(&self, py: Python<'_>) -> PyResult<String> {
+        let site_url = &self.client.bind(py).borrow().state.site_url;
+        let mut url = url::Url::parse(site_url).map_err(runtime_error)?;
+        url.set_path(&format!(
+            "{}/{}/Forms/AllItems.aspx",
+            url.path().trim_end_matches('/'),
+            self.title
+        ));
+        Ok(url.into())
     }
 }
 
@@ -539,7 +897,7 @@ fn item_from_value(
     }
     let fsobj_type = value.get("FileSystemObjectType").and_then(Value::as_i64);
     if fsobj_type == Some(1) {
-        return Ok(Py::new(
+        let folder = Py::new(
             py,
             SPFolder {
                 client: Some(client),
@@ -548,9 +906,12 @@ fn item_from_value(
                 properties,
                 list_url: Some(list_url),
                 item_id: Some(id),
+                resolve_task: None,
             },
-        )?
-        .into_any());
+        )?;
+        let handle = start_folder_resolution(py, &folder)?;
+        folder.bind(py).borrow_mut().resolve_task = Some(handle);
+        return Ok(folder.into_any());
     }
     if fsobj_type != Some(0) {
         return Err(PyRuntimeError::new_err(format!(
@@ -609,7 +970,7 @@ fn deferred_items(
     Ok(
         pyo3_async_runtimes::tokio::future_into_py_with_locals(py, locals, async move {
             let values = match next_url {
-                Some(url) => fetch_all(&state, url, None).await?,
+                Some(url) => fetch_all(Arc::clone(&state), url, None).await?,
                 None => Vec::new(),
             };
             Python::attach(|py| items_list(py, &client, &list_url, &values))
@@ -624,6 +985,7 @@ fn get_items_awaitable<'py>(
     title: Option<String>,
     id: Option<String>,
     caml: Option<String>,
+    folder_path: Option<String>,
     max_wait: Option<f64>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let state = Arc::clone(&client.bind(py).borrow().state);
@@ -645,7 +1007,11 @@ fn get_items_awaitable<'py>(
         };
 
         let (values, next_url) = if let Some(caml) = caml {
-            let body = json!({"query": {"__metadata": {"type": "SP.CamlQuery"}, "ViewXml": caml}});
+            let mut query = json!({"ViewXml": caml});
+            if let Some(folder_path) = folder_path {
+                query["FolderServerRelativeUrl"] = Value::String(folder_path);
+            }
+            let body = json!({"query": query});
             let data = state
                 .post_json(&format!("{list_url}/GetItems"), Some(&body), None)
                 .await?;
@@ -660,7 +1026,7 @@ fn get_items_awaitable<'py>(
             fetch_deferred(&state, format!("{list_url}/items"), None, max_wait).await?
         } else {
             (
-                fetch_all(&state, format!("{list_url}/items"), None).await?,
+                fetch_all(Arc::clone(&state), format!("{list_url}/items"), None).await?,
                 None,
             )
         };
@@ -693,17 +1059,43 @@ struct SharePointClient {
 #[pymethods]
 impl SharePointClient {
     #[new]
-    #[pyo3(signature = (site_url, get_token, *, properties=None, item_id=None, list_url=None))]
+    #[pyo3(signature = (site_url, credential, *, properties=None, item_id=None, list_url=None))]
     fn new(
         py: Python<'_>,
         site_url: &str,
-        get_token: Py<PyAny>,
+        credential: &CertificateCredential,
         properties: Option<Py<PyDict>>,
         item_id: Option<String>,
         list_url: Option<String>,
     ) -> PyResult<Self> {
         Ok(Self {
-            state: ClientState::new(site_url.trim_end_matches('/').to_owned(), get_token)?,
+            state: ClientState::new_with_runtime(
+                site_url.trim_end_matches('/').to_owned(),
+                &credential.inner,
+                pyo3_async_runtimes::tokio::get_runtime().handle(),
+            )?,
+            properties: properties.unwrap_or_else(|| PyDict::new(py).unbind()),
+            item_id,
+            list_url,
+        })
+    }
+
+    /// Builds a client around a pre-obtained token; it is never refreshed.
+    #[staticmethod]
+    #[pyo3(signature = (site_url, token, *, properties=None, item_id=None, list_url=None))]
+    fn from_static_token(
+        py: Python<'_>,
+        site_url: &str,
+        token: String,
+        properties: Option<Py<PyDict>>,
+        item_id: Option<String>,
+        list_url: Option<String>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            state: ClientState::with_static_token(
+                site_url.trim_end_matches('/').to_owned(),
+                token,
+            )?,
             properties: properties.unwrap_or_else(|| PyDict::new(py).unbind()),
             item_id,
             list_url,
@@ -734,7 +1126,11 @@ impl SharePointClient {
     }
 
     fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(slf) })
+        let state = Arc::clone(&slf.bind(py).borrow().state);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            state.tokens.wait_ready().await?;
+            Ok(slf)
+        })
     }
 
     fn __aexit__<'py>(
@@ -793,7 +1189,7 @@ impl SharePointClient {
                 fetch_deferred(&state, format!("{}/lists", state.web_url), None, max_wait).await?
             } else {
                 (
-                    fetch_all(&state, format!("{}/lists", state.web_url), None).await?,
+                    fetch_all(Arc::clone(&state), format!("{}/lists", state.web_url), None).await?,
                     None,
                 )
             };
@@ -807,7 +1203,7 @@ impl SharePointClient {
                         locals,
                         async move {
                             let values = match next_url {
-                                Some(url) => fetch_all(&state, url, None).await?,
+                                Some(url) => fetch_all(Arc::clone(&state), url, None).await?,
                                 None => Vec::new(),
                             };
                             Python::attach(|py| lists_list(py, &client, &values))
@@ -837,24 +1233,26 @@ impl SharePointClient {
         })
     }
 
-    #[pyo3(signature = (title=None, *, id=None, caml=None, max_wait=None))]
+    #[pyo3(signature = (title=None, *, id=None, caml=None, folder_path=None, max_wait=None))]
     fn get_items<'py>(
         slf: Py<Self>,
         py: Python<'py>,
         title: Option<String>,
         id: Option<String>,
         caml: Option<String>,
+        folder_path: Option<String>,
         max_wait: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        get_items_awaitable(py, slf, title, id, caml, max_wait)
+        get_items_awaitable(py, slf, title, id, caml, folder_path, max_wait)
     }
 
     fn get_file<'py>(slf: Py<Self>, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let path = browser_path(&path)?;
         let file = Py::new(
             py,
             SPFile {
                 client: slf,
-                server_relative_path: Some(path),
+                server_relative_path: Some(path.clone()),
                 properties: PyDict::new(py).unbind(),
                 list_url: None,
                 item_id: None,
@@ -864,13 +1262,21 @@ impl SharePointClient {
         let handle = start_file_resolution(py, &file)?;
         file.bind(py).borrow_mut().resolve_task = Some(handle);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            resolve_file(&file).await?;
+            if let Err(error) = resolve_file(&file).await {
+                if error.to_string().contains(" 404 ") {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "Either {path} does not exist or is a folder"
+                    )));
+                }
+                return Err(error);
+            }
             Ok(file)
         })
     }
 
     fn download<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&self.state);
+        let path = browser_path(&path)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let url = format!(
                 "{}/GetFileByServerRelativePath(DecodedUrl={})/$value",
@@ -892,6 +1298,7 @@ impl SharePointClient {
         overwrite: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&self.state);
+        let folder_path = browser_path(&folder_path)?;
         let content = content.as_bytes().to_vec();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let folder_url = format!(
@@ -988,6 +1395,7 @@ impl SharePointClient {
         overwrite: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&slf.bind(py).borrow().state);
+        let path = browser_path(&path)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let url = format!(
                 "{}/Folders/AddUsingPath(DecodedUrl={},Overwrite={})",
@@ -1006,6 +1414,7 @@ impl SharePointClient {
                         properties: value_dict(py, &data)?,
                         list_url: None,
                         item_id: None,
+                        resolve_task: None,
                     },
                 )
             })
@@ -1020,6 +1429,15 @@ impl SharePointClient {
                 .await?;
             Python::attach(|py| value_dict(py, &data))
         })
+    }
+
+    #[pyo3(signature = (path=None))]
+    fn ls<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        path: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        ls_awaitable(py, slf, path)
     }
 
     #[pyo3(signature = (path, *, login_name=None))]
@@ -1177,11 +1595,20 @@ impl SharePointClient {
 
 #[pymodule]
 fn async_sharepoint(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<CertificateCredential>()?;
     module.add_class::<SharePointClient>()?;
     module.add_class::<SPFile>()?;
     module.add_class::<SPFolder>()?;
     module.add_class::<SPList>()?;
-    module.add("__all__", vec!["SPFile", "SPFolder", "SharePointClient"])?;
+    module.add(
+        "__all__",
+        vec![
+            "CertificateCredential",
+            "SPFile",
+            "SPFolder",
+            "SharePointClient",
+        ],
+    )?;
     Ok(())
 }
 

@@ -5,15 +5,21 @@ from typing import Any, cast
 import pytest
 
 import async_sharepoint
-from async_sharepoint import SharePointClient, SPFile, SPFolder
+from async_sharepoint import CertificateCredential, SharePointClient, SPFile, SPFolder
 
 
-def get_token() -> dict:
-    return {"access_token": "test-token", "expires_in": 3600}
+def make_client(site_url: str) -> SharePointClient:
+    return SharePointClient.from_static_token(site_url, "test-token")
 
 
 def test_public_exports() -> None:
-    assert async_sharepoint.__all__ == ["SPFile", "SPFolder", "SharePointClient"]
+    assert async_sharepoint.__all__ == [
+        "CertificateCredential",
+        "SPFile",
+        "SPFolder",
+        "SharePointClient",
+    ]
+    assert async_sharepoint.CertificateCredential is CertificateCredential
     assert async_sharepoint.SPFile is SPFile
     assert async_sharepoint.SPFolder is SPFolder
     assert async_sharepoint.SharePointClient is SharePointClient
@@ -36,7 +42,14 @@ def test_public_signatures() -> None:
 
     assert signature_parameters(SharePointClient) == [
         ("site_url", positional, required),
-        ("get_token", positional, required),
+        ("credential", positional, required),
+        ("properties", keyword, None),
+        ("item_id", keyword, None),
+        ("list_url", keyword, None),
+    ]
+    assert signature_parameters(SharePointClient.from_static_token) == [
+        ("site_url", positional, required),
+        ("token", positional, required),
         ("properties", keyword, None),
         ("item_id", keyword, None),
         ("list_url", keyword, None),
@@ -52,6 +65,7 @@ def test_public_signatures() -> None:
         ("title", positional, None),
         ("id", keyword, None),
         ("caml", keyword, None),
+            ("folder_path", keyword, None),
         ("max_wait", keyword, None),
     ]
     assert signature_parameters(SharePointClient.upload)[-1] == ("overwrite", keyword, True)
@@ -66,13 +80,13 @@ def test_public_signatures() -> None:
 
 @pytest.mark.asyncio
 async def test_context_manager() -> None:
-    async with SharePointClient("https://example.test/sites/team/", get_token) as client:
+    async with make_client("https://example.test/sites/team/") as client:
         assert client.site_url == "https://example.test/sites/team"
 
 
 @pytest.mark.asyncio
 async def test_argument_validation() -> None:
-    client = SharePointClient("https://example.test/sites/team", get_token)
+    client = make_client("https://example.test/sites/team")
     invalid_get = cast(Any, client.get)
     try:
         with pytest.raises(ValueError, match="specify only one"):
@@ -94,7 +108,7 @@ def test_property_fallback_and_file_url() -> None:
         _ = folder.Missing
 
     file = SPFile(
-        client=SharePointClient("https://example.test/sites/team", get_token),
+        client=make_client("https://example.test/sites/team"),
         server_relative_path="/sites/team/My File.txt",
         properties={"ServerRedirectedEmbedUri": "https://example.test/sites/team/My File.txt?action=interactive&x=1"},
     )
