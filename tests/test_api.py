@@ -5,7 +5,7 @@ from typing import Any, cast
 import pytest
 
 import async_sharepoint
-from async_sharepoint import CertificateCredential, SharePointClient, SPFile, SPFolder
+from async_sharepoint import CertificateCredential, SharePointClient, SPFile, SPFolder, SPItem
 
 
 def make_client(site_url: str) -> SharePointClient:
@@ -17,11 +17,13 @@ def test_public_exports() -> None:
         "CertificateCredential",
         "SPFile",
         "SPFolder",
+        "SPItem",
         "SharePointClient",
     ]
     assert async_sharepoint.CertificateCredential is CertificateCredential
     assert async_sharepoint.SPFile is SPFile
     assert async_sharepoint.SPFolder is SPFolder
+    assert async_sharepoint.SPItem is SPItem
     assert async_sharepoint.SharePointClient is SharePointClient
 
 

@@ -485,85 +485,91 @@ fn ls_awaitable<'py>(
     path: Option<String>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let state = Arc::clone(&client.bind(py).borrow().state);
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let documents = state
-            .get_json(&format!("{}/DefaultDocumentLibrary", state.web_url), None)
+    pyo3_async_runtimes::tokio::future_into_py(py, ls_items(state, client, path))
+}
+
+async fn ls_items(
+    state: Arc<ClientState>,
+    client: Py<SharePointClient>,
+    path: Option<String>,
+) -> PyResult<Py<PyAny>> {
+    let documents = state
+        .get_json(&format!("{}/DefaultDocumentLibrary", state.web_url), None)
+        .await
+        .map_err(runtime_error)?;
+    let id = odata::string(&documents, "Id").unwrap_or_default();
+    let root_path = {
+        let root = state
+            .get_json(
+                &format!(
+                    "{}/lists/GetById({})/RootFolder",
+                    state.web_url,
+                    odata::literal(&id)
+                ),
+                None,
+            )
             .await
             .map_err(runtime_error)?;
-        let id = odata::string(&documents, "Id").unwrap_or_default();
-        let root_path = {
-            let root = state
-                .get_json(
-                    &format!(
-                        "{}/lists/GetById({})/RootFolder",
-                        state.web_url,
-                        odata::literal(&id)
-                    ),
-                    None,
-                )
+        odata::string(&root, "ServerRelativeUrl").ok_or_else(|| {
+            PyRuntimeError::new_err("DefaultDocumentLibrary root has no ServerRelativeUrl")
+        })?
+    };
+    let path = match path {
+        Some(path) => browser_path(&path)?,
+        None => root_path.clone(),
+    };
+    let list_url = format!("{}/lists/GetById({})", state.web_url, odata::literal(&id));
+    // SharePoint's CAML FileDirRef equality filter 500s when compared against the
+    // document library's own root folder, so scope the root via FolderServerRelativeUrl
+    // alone instead of also filtering by FileDirRef.
+    let caml = if path == root_path {
+        "<View Scope=\"Default\"><ViewFields><FieldRef Name=\"FileRef\" /><FieldRef Name=\"FileLeafRef\" /><FieldRef Name=\"FSObjType\" /><FieldRef Name=\"FileDirRef\" /></ViewFields><RowLimit>500</RowLimit></View>"
+                .to_owned()
+    } else {
+        format!(
+            "<View Scope=\"RecursiveAll\"><ViewFields><FieldRef Name=\"FileRef\" /><FieldRef Name=\"FileLeafRef\" /><FieldRef Name=\"FSObjType\" /><FieldRef Name=\"FileDirRef\" /></ViewFields><Query><Where><Eq><FieldRef Name=\"FileDirRef\" /><Value Type=\"Text\">{path}</Value></Eq></Where></Query><RowLimit>500</RowLimit></View>"
+        )
+    };
+    let body = json!({"query": {"ViewXml": caml, "FolderServerRelativeUrl": path}});
+    let data = match state
+        .post_json(&format!("{list_url}/GetItems"), Some(&body), None)
+        .await
+    {
+        Ok(data) => data,
+        Err(error) if error.to_string().contains(" 500 ") => {
+            let file_url = format!(
+                "{}/GetFileByServerRelativePath(DecodedUrl={})",
+                state.web_url,
+                odata::literal(&path)
+            );
+            let file = state
+                .get_json(&file_url, None)
                 .await
                 .map_err(runtime_error)?;
-            odata::string(&root, "ServerRelativeUrl").ok_or_else(|| {
-                PyRuntimeError::new_err("DefaultDocumentLibrary root has no ServerRelativeUrl")
-            })?
-        };
-        let path = match path {
-            Some(path) => browser_path(&path)?,
-            None => root_path.clone(),
-        };
-        let list_url = format!("{}/lists/GetById({})", state.web_url, odata::literal(&id));
-        // SharePoint's CAML FileDirRef equality filter 500s when compared against the
-        // document library's own root folder, so scope the root via FolderServerRelativeUrl
-        // alone instead of also filtering by FileDirRef.
-        let caml = if path == root_path {
-            "<View Scope=\"Default\"><ViewFields><FieldRef Name=\"FileRef\" /><FieldRef Name=\"FileLeafRef\" /><FieldRef Name=\"FSObjType\" /><FieldRef Name=\"FileDirRef\" /></ViewFields><RowLimit>500</RowLimit></View>"
-                .to_owned()
-        } else {
-            format!(
-                "<View Scope=\"RecursiveAll\"><ViewFields><FieldRef Name=\"FileRef\" /><FieldRef Name=\"FileLeafRef\" /><FieldRef Name=\"FSObjType\" /><FieldRef Name=\"FileDirRef\" /></ViewFields><Query><Where><Eq><FieldRef Name=\"FileDirRef\" /><Value Type=\"Text\">{path}</Value></Eq></Where></Query><RowLimit>500</RowLimit></View>"
-            )
-        };
-        let body = json!({"query": {"ViewXml": caml, "FolderServerRelativeUrl": path}});
-        let data = match state
-            .post_json(&format!("{list_url}/GetItems"), Some(&body), None)
-            .await
-        {
-            Ok(data) => data,
-            Err(error) if error.to_string().contains(" 500 ") => {
-                let file_url = format!(
-                    "{}/GetFileByServerRelativePath(DecodedUrl={})",
-                    state.web_url,
-                    odata::literal(&path)
-                );
-                let file = state
-                    .get_json(&file_url, None)
-                    .await
-                    .map_err(runtime_error)?;
-                return Python::attach(|py| {
-                    let file = Py::new(
-                        py,
-                        SPFile {
-                            client,
-                            server_relative_path: odata::string(&file, "ServerRelativeUrl"),
-                            properties: value_dict(py, &file)?,
-                            list_url: Some(list_url),
-                            item_id: None,
-                            unique_id: None,
-                            resolve_task: None,
-                        },
-                    )?;
-                    Ok(PyList::new(py, [file])?.unbind())
-                });
-            }
-            Err(error) => return Err(runtime_error(error)),
-        };
-        let values = data
-            .get("value")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        Python::attach(|py| items_list(py, &client, &list_url, &values))
-    })
+            return Python::attach(|py| {
+                let file = Py::new(
+                    py,
+                    SPFile {
+                        client,
+                        server_relative_path: odata::string(&file, "ServerRelativeUrl"),
+                        properties: value_dict(py, &file)?,
+                        list_url: Some(list_url),
+                        item_id: None,
+                        unique_id: None,
+                        resolve_task: None,
+                    },
+                )?;
+                Ok(PyList::new(py, [file])?.unbind().into_any())
+            });
+        }
+        Err(error) => return Err(runtime_error(error)),
+    };
+    let values = data
+        .get("value")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Python::attach(|py| Ok(items_list(py, &client, &list_url, &values)?.into_any()))
 }
 
 #[pymethods]
@@ -629,15 +635,22 @@ impl SPFolder {
     }
 
     fn ls<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let path = slf.bind(py).borrow().server_relative_url.clone();
-        let client = slf
-            .bind(py)
-            .borrow()
-            .client
-            .as_ref()
-            .map(|client| client.clone_ref(py))
-            .ok_or_else(|| PyRuntimeError::new_err("folder has no client"))?;
-        ls_awaitable(py, client, path)
+        let (client, path) = {
+            let folder = slf.bind(py).borrow();
+            let client = folder
+                .client
+                .as_ref()
+                .map(|client| client.clone_ref(py))
+                .ok_or_else(|| PyRuntimeError::new_err("folder has no client"))?;
+            (client, folder.server_relative_url.clone())
+        };
+        if let Some(path) = path {
+            return ls_awaitable(py, client, Some(path));
+        }
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (state, path) = resolve_folder(&slf).await?;
+            ls_items(state, client, Some(path)).await
+        })
     }
 
     fn get_url(&self, py: Python<'_>) -> PyResult<String> {
@@ -1695,12 +1708,18 @@ fn async_sharepoint(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SPFile>()?;
     module.add_class::<SPFolder>()?;
     module.add_class::<SPList>()?;
+    let sp_item = module
+        .getattr("SPFile")?
+        .call_method1("__or__", (module.getattr("SPFolder")?,))?
+        .call_method1("__or__", (module.getattr("SharePointClient")?,))?;
+    module.add("SPItem", sp_item)?;
     module.add(
         "__all__",
         vec![
             "CertificateCredential",
             "SPFile",
             "SPFolder",
+            "SPItem",
             "SharePointClient",
         ],
     )?;
