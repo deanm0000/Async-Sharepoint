@@ -65,7 +65,7 @@ def test_public_signatures() -> None:
         ("title", positional, None),
         ("id", keyword, None),
         ("caml", keyword, None),
-            ("folder_path", keyword, None),
+        ("folder_path", keyword, None),
         ("max_wait", keyword, None),
     ]
     assert signature_parameters(SharePointClient.upload)[-1] == ("overwrite", keyword, True)

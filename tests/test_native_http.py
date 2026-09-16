@@ -181,10 +181,7 @@ async def test_native_sharepoint_operations() -> None:
             )
             assert await file.download() == b"report-content"
 
-            browser_file_url = (
-                f"{site_url}/Documents/Forms/AllItems.aspx?"
-                "id=%2Fsites%2Fteam%2FDocuments%2Freport.txt"
-            )
+            browser_file_url = f"{site_url}/Documents/Forms/AllItems.aspx?id=%2Fsites%2Fteam%2FDocuments%2Freport.txt"
             assert (await client.get_file(browser_file_url)).server_relative_path.endswith("report.txt")
             assert await client.download(browser_file_url) == b"report-content"
 
@@ -193,9 +190,7 @@ async def test_native_sharepoint_operations() -> None:
             assert isinstance(listed[1], SPFile)
             assert len(await listed[0].ls()) == 2
             assert (await client.get("Documents")).get_url().endswith("Documents/Forms/AllItems.aspx")
-            assert listed[0].get_url().endswith(
-                "Documents/Forms/AllItems.aspx?id=%2Fsites%2Fteam%2FDocuments%2FFolder"
-            )
+            assert listed[0].get_url().endswith("Documents/Forms/AllItems.aspx?id=%2Fsites%2Fteam%2FDocuments%2FFolder")
 
             caml_items, caml_remaining = await client.get_items("Documents", caml="<View />", max_wait=0)
             assert caml_items == []
