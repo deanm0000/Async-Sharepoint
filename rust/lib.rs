@@ -74,9 +74,7 @@ fn browser_file_locator(path: &str) -> PyResult<FileLocator> {
     url.query_pairs()
         .find(|(key, _)| key == "id")
         .map(|(_, value)| FileLocator::Path(value.into_owned()))
-        .ok_or_else(|| {
-            PyValueError::new_err("browser URL has no id or sourcedoc query parameter")
-        })
+        .ok_or_else(|| PyValueError::new_err("browser URL has no id or sourcedoc query parameter"))
 }
 
 fn browser_url(site_url: &str, path: &str, is_file: bool) -> PyResult<String> {
@@ -372,7 +370,11 @@ fn properties_label(properties: &Py<PyDict>, py: Python<'_>) -> PyResult<String>
         Some(value) => value.is_truthy()?,
         None => false,
     };
-    let value = if truthy_title { title } else { dict.get_item("Name")? };
+    let value = if truthy_title {
+        title
+    } else {
+        dict.get_item("Name")?
+    };
     match value {
         Some(value) => Ok(value.str()?.to_string()),
         None => Ok("None".to_owned()),

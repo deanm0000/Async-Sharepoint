@@ -63,9 +63,7 @@ class SharePointHandler(BaseHTTPRequestHandler):
             self.send_json(
                 {
                     "ServerRelativeUrl": "/sites/team/Documents/report.txt",
-                    "ServerRedirectedEmbedUri": (
-                        f"{self.base_url}/sites/team/Documents/report.txt?action=interactive"
-                    ),
+                    "ServerRedirectedEmbedUri": (f"{self.base_url}/sites/team/Documents/report.txt?action=interactive"),
                     "Name": "report.txt",
                 }
             )
