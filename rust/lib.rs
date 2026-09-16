@@ -197,7 +197,7 @@ async fn fetch_all(
 
         loop {
             while tasks.len() <= max_guesses
-                && terminal_at.map_or(true, |t| frontier_id + frontier_n * next_offset <= t)
+                && terminal_at.is_none_or(|t| frontier_id + frontier_n * next_offset <= t)
             {
                 let guess_id = frontier_id + frontier_n * next_offset;
                 let guess_url = odata::with_p_id(&template, guess_id);
@@ -223,8 +223,8 @@ async fn fetch_all(
             };
             abort_handles.remove(&outcome.guess_id);
 
-            let (page_len, unique_added) = merge_page(&mut results, &mut seen, &outcome.data);
-            let (min_id, max_id) = batch_min_max(&outcome.data);
+            let (page_len, _unique_added) = merge_page(&mut results, &mut seen, &outcome.data);
+            let (_min_id, _max_id) = batch_min_max(&outcome.data);
             // println!(
             //     "Guess id={} -> next_url id={:?}, batch min={:?} max={:?}, records={}, unique_added={}",
             //     outcome.guess_id, outcome.next_id, min_id, max_id, page_len, unique_added
@@ -367,11 +367,10 @@ struct SPFolder {
 
 impl Drop for SPFolder {
     fn drop(&mut self) {
-        if let Some(handle) = self.resolve_task.take() {
-            if !handle.is_finished() {
+        if let Some(handle) = self.resolve_task.take()
+            && !handle.is_finished() {
                 handle.abort();
             }
-        }
     }
 }
 
@@ -608,11 +607,10 @@ struct SPFile {
 
 impl Drop for SPFile {
     fn drop(&mut self) {
-        if let Some(handle) = self.resolve_task.take() {
-            if !handle.is_finished() {
+        if let Some(handle) = self.resolve_task.take()
+            && !handle.is_finished() {
                 handle.abort();
             }
-        }
     }
 }
 
