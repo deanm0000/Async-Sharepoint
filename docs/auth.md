@@ -1,7 +1,48 @@
-# Token management design
+# Authentication
 
-Internal notes for `rust/auth.rs`. Not part of the published docs site — this describes *why* the
-refresher is shaped the way it is, which the code can't say on its own.
+## Certificate credentials
+
+Async Sharepoint uses the Entra ID client-credentials flow with a certificate:
+
+```python
+from async_sharepoint import CertificateCredential, SharePointClient
+
+credential = CertificateCredential(
+  tenant_id="00000000-0000-0000-0000-000000000000",
+  client_id="11111111-1111-1111-1111-111111111111",
+  private_key_path="/path/to/azure-app-private.key",
+  thumbprint="D33CFD3BB83E0EFB90AF709C897025286244FA0E",
+)
+
+async with SharePointClient("https://example.sharepoint.com/sites/Team", credential) as client:
+  items = await client.ls()
+```
+
+The private key file may be a standalone PEM key or a combined certificate-and-key file; only the
+`PRIVATE KEY` block is read. `thumbprint` is the certificate's hex-encoded SHA-1 digest, as shown
+in the Azure portal. Malformed key and thumbprint values raise when the credential is constructed.
+
+The OAuth scope is derived from the site host. For example,
+`https://example.sharepoint.com/sites/Team` uses `https://example.sharepoint.com/.default`.
+
+Entering the async context manager waits for the first token, so invalid credentials raise before
+the first SharePoint request. A background task refreshes the token five minutes before expiry and
+after a 401 or 403 response. Concurrent requests share that token and coalesce refresh attempts.
+
+## Existing access tokens
+
+Use `from_static_token()` when another component owns token acquisition:
+
+```python
+async with SharePointClient.from_static_token(site_url, access_token) as client:
+  items = await client.ls()
+```
+
+A static token is never refreshed.
+
+## Token management design
+
+The rest of this page describes why the native refresher is shaped the way it is.
 
 ## Why this exists
 

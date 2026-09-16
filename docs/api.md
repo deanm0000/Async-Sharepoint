@@ -47,12 +47,14 @@ The client is an async context manager. Its public methods are:
 - `await aclose()`
 - `await get(title=None, *, id=None, max_wait=None)`
 - `await get_default_document_library()`
-- `await get_items(title=None, *, id=None, caml=None, max_wait=None)`
+- `await get_items()`
 - `await get_file(path)`
+- `await ls()`
 - `await download(path)`
 
 `path` accepts a server-relative path, an `AllItems.aspx?id=...` browser link, or a
 `Doc.aspx?sourcedoc={GUID}` browser/share link (resolved via the file's unique id).
+
 - `await upload(folder_path, filename, content, *, overwrite=True)`
 - `await add_folder(path, *, overwrite=False)`
 - `await get_current_user()`
@@ -62,16 +64,16 @@ The client is an async context manager. Its public methods are:
 ## SPFile
 
 File values expose `client`, `server_relative_path`, `properties`, `list_url`,
-`item_id`, and `resolved` (a read-only property that is true once resolution
-has completed). Their public methods are `resolve`, `download`, and `get_url`.
+`item_id`, `unique_id`, and `resolved` (a read-only property that is true once resolution
+has completed). Their public methods are `resolve`, `download`, `get_url`, and `browser_url`.
 
 ## SPFolder
 
 Folder values expose `client`, `server_relative_url`, `properties`, `list_url`,
-and `item_id`.
+`item_id`, and `resolved`. Their public methods are `resolve`, `ls`, and `get_url`.
 
 ## SPList
 
 List values are returned by `SharePointClient.get` and
 `get_default_document_library`. They expose `client`, `id`, `title`,
-`properties`, and `get_items(*, caml=None, max_wait=None)`.
+`properties`, `get_items(*, caml=None, folder_path=None, max_wait=None)`, and `get_url`.

@@ -12,14 +12,31 @@ The repository also contains a standalone Rust crate in `core/`, published as
 * Created by [Dean MacGregor](na) | GitHub [@deanm0000](https://github.com/deanm0000) | PyPI [@deanm0000](https://pypi.org/user/deanm0000/)
 * MIT License
 
+## Why this project
+
+The established Python SharePoint libraries are synchronous, which makes large file listings slow
+and difficult to use in a server without blocking its event loop. The cost is compounded when each
+list item requires another synchronous request before basic file properties such as its name and
+path are available.
+
+Async Sharepoint was built to make that workflow asynchronous and significantly faster. It fetches
+paginated list results optimistically in parallel and eagerly resolves the additional properties of
+returned files and folders concurrently.
+
+This project does not try to cover every SharePoint API. It focuses on fast list,
+file, and folder operations. If an application needs broad access to the full SharePoint feature
+set, an established general-purpose SharePoint library will be a better fit. I'm not necessarily opposed to making it feature complete, it just isn't a priority.
+
 ## Features
 
 * Async list, item, file, folder, permission, and search operations
 * Native Entra ID certificate authentication with background token refresh
 * Automatic token caching and refresh
 * Retry handling for throttling and transient SharePoint failures
-* Paginated queries and chunked uploads
 * Python 3.10+ stable-ABI Linux wheels
+* Eager and optimistic paginated query parallelization
+* Eager and parallelized item refinement when getting lists
+
 
 ## Installation
 
