@@ -117,9 +117,7 @@ def test_property_fallback_and_file_url() -> None:
     try:
         assert file.get_url() == "https://example.test/sites/team/My%20File.txt?action=default&x=1"
         assert file.properties["ServerRelativeUrl"] == "/sites/team/My File.txt"
-        assert (
-            file.embed_url() == "https://example.test/sites/team/My File.txt?action=interactive&x=1"
-        )
+        assert file.embed_url() == "https://example.test/sites/team/My File.txt?action=interactive&x=1"
     finally:
 
         async def close_client() -> None:

@@ -8,14 +8,14 @@ Async Sharepoint uses the Entra ID client-credentials flow with a certificate:
 from async_sharepoint import CertificateCredential, SharePointClient
 
 credential = CertificateCredential(
-  tenant_id="00000000-0000-0000-0000-000000000000",
-  client_id="11111111-1111-1111-1111-111111111111",
-  private_key_path="/path/to/azure-app-private.key",
-  thumbprint="D33CFD3BB83E0EFB90AF709C897025286244FA0E",
+    tenant_id="00000000-0000-0000-0000-000000000000",
+    client_id="11111111-1111-1111-1111-111111111111",
+    private_key_path="/path/to/azure-app-private.key",
+    thumbprint="D33CFD3BB83E0EFB90AF709C897025286244FA0E",
 )
 
 async with SharePointClient("https://example.sharepoint.com/sites/Team", credential) as client:
-  items = await client.ls()
+    items = await client.ls()
 ```
 
 The private key file may be a standalone PEM key or a combined certificate-and-key file; only the
@@ -35,7 +35,7 @@ Use `from_static_token()` when another component owns token acquisition:
 
 ```python
 async with SharePointClient.from_static_token(site_url, access_token) as client:
-  items = await client.ls()
+    items = await client.ls()
 ```
 
 A static token is never refreshed.
