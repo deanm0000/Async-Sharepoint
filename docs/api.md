@@ -63,9 +63,10 @@ The client is an async context manager. Its public methods are:
 
 ## SPFile
 
-File values expose `client`, `server_relative_path`, `properties`, `list_url`,
-`item_id`, `unique_id`, and `resolved` (a read-only property that is true once resolution
-has completed). Their public methods are `resolve`, `download`, `get_url`, and `browser_url`.
+File values expose `client`, `properties`,
+`list_url`, `item_id`, `unique_id`, and `resolved` (a read-only property that is true once
+resolution has completed). Their public methods are `resolve`, `download`, `get_url`,
+`browser_url`, and `embed_url`.
 
 ## SPFolder
 

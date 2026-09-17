@@ -176,7 +176,7 @@ async def test_native_sharepoint_operations() -> None:
             assert items[0].server_relative_url == "/sites/team/Documents/Folder"
             assert isinstance(items[1], SPFile)
             await items[1].resolve()
-            assert items[1].server_relative_path == "/sites/team/Documents/report.txt"
+            assert items[1].properties["ServerRelativeUrl"] == "/sites/team/Documents/report.txt"
             assert await items[1].download() == b"report-content"
 
             file = await client.get_file("/sites/team/Documents/report.txt")
@@ -190,7 +190,7 @@ async def test_native_sharepoint_operations() -> None:
             assert await file.download() == b"report-content"
 
             browser_file_url = f"{site_url}/Documents/Forms/AllItems.aspx?id=%2Fsites%2Fteam%2FDocuments%2Freport.txt"
-            relative_path = (await client.get_file(browser_file_url)).server_relative_path
+            relative_path = (await client.get_file(browser_file_url)).properties["ServerRelativeUrl"]
             assert relative_path is not None
             assert relative_path.endswith("report.txt")
             assert await client.download(browser_file_url) == b"report-content"
@@ -201,7 +201,7 @@ async def test_native_sharepoint_operations() -> None:
             )
             sourcedoc_file = await client.get_file(sourcedoc_url)
             assert sourcedoc_file.unique_id == "01246A4B-84D7-49D6-8937-895D3C0F50A9"
-            assert sourcedoc_file.server_relative_path == "/sites/team/Documents/report.txt"
+            assert sourcedoc_file.properties["ServerRelativeUrl"] == "/sites/team/Documents/report.txt"
             assert await client.download(sourcedoc_url) == b"report-content"
 
             listed = await client.ls("/sites/team/Documents/Folder")
@@ -217,9 +217,9 @@ async def test_native_sharepoint_operations() -> None:
 
             assert await client.download("/sites/team/Documents/report.txt") == b"report-content"
             uploaded = await client.upload("/sites/team/Documents", "upload.txt", b"uploaded content")
-            assert uploaded.server_relative_path == "/sites/team/Documents/upload.txt"
+            assert uploaded.properties["ServerRelativeUrl"] == "/sites/team/Documents/upload.txt"
             large = await client.upload("/sites/team/Documents", "large.bin", b"x" * (8 * 1024 * 1024 + 1))
-            assert large.server_relative_path == "/sites/team/Documents/large.bin"
+            assert large.properties["ServerRelativeUrl"] == "/sites/team/Documents/large.bin"
             upload_requests = [
                 (path, body)
                 for method, path, body in SharePointHandler.requests

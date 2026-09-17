@@ -116,6 +116,61 @@ def test_property_fallback_and_file_url() -> None:
     )
     try:
         assert file.get_url() == "https://example.test/sites/team/My%20File.txt?action=default&x=1"
+        assert file.properties["ServerRelativeUrl"] == "/sites/team/My File.txt"
+        assert (
+            file.embed_url() == "https://example.test/sites/team/My File.txt?action=interactive&x=1"
+        )
+    finally:
+
+        async def close_client() -> None:
+            await file.client.aclose()
+
+        asyncio.run(close_client())
+
+
+def test_embed_url_fallback_without_redirect_uri() -> None:
+    file = SPFile(
+        client=make_client("https://example.test/sites/team"),
+        unique_id="7c7f8d05-38f9-437e-a672-ba3c94ee89ff",
+        properties={"ContentTag": "{7C7F8D05-38F9-437E-A672-BA3C94EE89FF},3,7"},
+    )
+    try:
+        assert file.embed_url() == (
+            "https://example.test/sites/team/_layouts/15/Doc.aspx"
+            "?sourcedoc=%7B7C7F8D05-38F9-437E-A672-BA3C94EE89FF%7D&action=interactivepreview"
+        )
+    finally:
+
+        async def close_client() -> None:
+            await file.client.aclose()
+
+        asyncio.run(close_client())
+
+    file = SPFile(
+        client=make_client("https://example.test/sites/team"),
+        unique_id="7c7f8d05-38f9-437e-a672-ba3c94ee89ff",
+        properties={"UniqueId": "7c7f8d05-38f9-437e-a672-ba3c94ee89ff"},
+    )
+    try:
+        assert file.embed_url() == (
+            "https://example.test/sites/team/_layouts/15/Doc.aspx"
+            "?sourcedoc=%7B7c7f8d05-38f9-437e-a672-ba3c94ee89ff%7D&action=interactivepreview"
+        )
+    finally:
+
+        async def close_client() -> None:
+            await file.client.aclose()
+
+        asyncio.run(close_client())
+
+    file = SPFile(
+        client=make_client("https://example.test/sites/team"),
+        unique_id="7c7f8d05-38f9-437e-a672-ba3c94ee89ff",
+        properties={},
+    )
+    try:
+        with pytest.raises(RuntimeError, match="ServerRedirectedEmbedUri"):
+            file.embed_url()
     finally:
 
         async def close_client() -> None:

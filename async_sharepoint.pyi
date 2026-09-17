@@ -1,3 +1,4 @@
+from asyncio import Task
 from collections.abc import Awaitable
 from typing import Any, TypeAlias, overload
 
@@ -126,10 +127,9 @@ class SPFile:
     ----------
     client : SharePointClient
         Client used to resolve and access the file.
-    server_relative_path : str or None
-        Server-relative file path, available after resolution.
     properties : dict[str, Any]
-        SharePoint properties. Keys are also available through attribute access.
+        SharePoint properties. Keys are
+        also available through attribute access.
     list_url : str or None
         REST URL of the file's parent list.
     item_id : str or None
@@ -141,7 +141,6 @@ class SPFile:
     """
 
     client: SharePointClient
-    server_relative_path: str | None
     properties: dict[str, Any]
     list_url: str | None
     item_id: str | None
@@ -210,6 +209,23 @@ class SPFile:
         >>> file_url = file.browser_url()
         """
         ...
+    def embed_url(self) -> str:
+        """Return a URL suitable for embedding or previewing the file.
+
+        Uses ``ServerRedirectedEmbedUri`` if present, otherwise builds a Doc.aspx
+        preview link from the file's GUID (``UniqueId``, else ``ContentTag``/``ETag``).
+
+        Returns
+        -------
+        str
+            URL that opens an interactive preview of the file.
+
+        Examples
+        --------
+        >>> await file.resolve()
+        >>> preview_url = file.embed_url()
+        """
+        ...
     def __getattr__(self, name: str) -> Any: ...
     def __repr__(self) -> str: ...
     def __str__(self) -> str: ...
@@ -273,7 +289,7 @@ class SPList:
         caml: str | None = None,
         folder_path: str | None = None,
         max_wait: float,
-    ) -> tuple[list[SPItem], Awaitable[list[SPItem]]]: ...
+    ) -> tuple[list[SPItem], Task[list[SPItem]]]: ...
     def get_url(self) -> str:
         """Return the list's SharePoint browser URL.
 

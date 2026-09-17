@@ -159,13 +159,15 @@ sharing_link = (
 content = await client.download(sharing_link)
 ```
 
-An `SPFile` can produce two useful SharePoint links. `get_url()` uses SharePoint's preferred URL
-for the file, while `browser_url()` builds its document-library browsing URL:
+An `SPFile` can produce three useful SharePoint links. `get_url()` uses SharePoint's preferred URL
+for the file, `browser_url()` builds its document-library browsing URL, and `embed_url()` builds a
+preview/embed link:
 
 ```python
 await file.resolve()
 preferred_link = file.get_url()
 library_link = file.browser_url()
+preview_link = file.embed_url()
 ```
 
 Items returned by a list query start resolving their additional properties immediately in the
@@ -186,7 +188,7 @@ with open("results.csv", "rb") as source:
         overwrite=True,
     )
 
-print(uploaded.server_relative_path)
+print(uploaded.properties["ServerRelativeUrl"])
 ```
 
 Set `overwrite=False` on `upload()` to reject an existing filename. `add_folder()` also accepts

@@ -32,7 +32,7 @@ files = [item for item in items if item.FileSystemObjectType == 0]
 
 # Refinement began as soon as each SPFile was created.
 await files[0].resolve()
-print(files[0].Name, files[0].server_relative_path)
+print(files[0].Name, files[0].ServerRelativeUrl)
 ```
 
 You usually do not need to call `resolve()` yourself. Async methods that need refined data, such as

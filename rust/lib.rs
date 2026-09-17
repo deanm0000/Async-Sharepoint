@@ -551,7 +551,6 @@ async fn ls_items(
                     py,
                     SPFile {
                         client,
-                        server_relative_path: odata::string(&file, "ServerRelativeUrl"),
                         properties: value_dict(py, &file)?,
                         list_url: Some(list_url),
                         item_id: None,
@@ -669,8 +668,6 @@ impl SPFolder {
 #[pyclass(module = "async_sharepoint")]
 struct SPFile {
     client: Py<SharePointClient>,
-    #[pyo3(get, set)]
-    server_relative_path: Option<String>,
     properties: Py<PyDict>,
     #[pyo3(get, set)]
     list_url: Option<String>,
@@ -678,7 +675,7 @@ struct SPFile {
     item_id: Option<String>,
     #[pyo3(get, set)]
     unique_id: Option<String>,
-    resolve_task: Option<tokio::task::JoinHandle<PyResult<Option<String>>>>,
+    resolve_task: Option<tokio::task::JoinHandle<PyResult<()>>>,
 }
 
 impl Drop for SPFile {
@@ -691,46 +688,80 @@ impl Drop for SPFile {
     }
 }
 
+fn properties_server_relative_path(properties: &Py<PyDict>, py: Python<'_>) -> Option<String> {
+    properties
+        .bind(py)
+        .get_item("ServerRelativeUrl")
+        .ok()
+        .flatten()
+        .and_then(|value| value.extract::<String>().ok())
+}
+
+/// Extracts the file GUID used to build an embed/preview URL, preferring the
+/// unparsed `UniqueId`, then falling back to the GUID embedded in `ContentTag` or `ETag`
+/// (both formatted like `{GUID},...`).
+fn properties_embed_guid(properties: &Py<PyDict>, py: Python<'_>) -> PyResult<Option<String>> {
+    let dict = properties.bind(py);
+    if let Some(value) = dict.get_item("UniqueId")?
+        && value.is_truthy()?
+    {
+        return Ok(Some(value.extract()?));
+    }
+    for key in ["ContentTag", "ETag"] {
+        if let Some(value) = dict.get_item(key)?
+            && value.is_truthy()?
+        {
+            let text: String = value.extract()?;
+            if let Some(start) = text.find('{')
+                && let Some(end) = text[start..].find('}').map(|end| start + end)
+            {
+                return Ok(Some(text[start + 1..end].to_owned()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn start_file_resolution(
     py: Python<'_>,
     file: &Py<SPFile>,
-) -> PyResult<tokio::task::JoinHandle<PyResult<Option<String>>>> {
+) -> PyResult<tokio::task::JoinHandle<PyResult<()>>> {
     let file = file.bind(py).borrow();
     let state = Arc::clone(&file.client.bind(py).borrow().state);
     let properties = file.properties.clone_ref(py);
-    let (file_url, list_item_url) = if let Some(path) = &file.server_relative_path {
-        let file_url = format!(
-            "{}/GetFileByServerRelativePath(DecodedUrl={})",
-            state.web_url,
-            odata::literal(path)
-        );
-        (
-            file_url.clone(),
-            Some(format!("{file_url}/ListItemAllFields")),
-        )
-    } else if let Some(unique_id) = &file.unique_id {
-        let file_url = format!("{}/GetFileById(guid'{}')", state.web_url, unique_id);
-        (
-            file_url.clone(),
-            Some(format!("{file_url}/ListItemAllFields")),
-        )
-    } else {
-        (
-            format!(
-                "{}/items({})/File",
-                file.list_url
-                    .as_deref()
-                    .ok_or_else(|| PyRuntimeError::new_err("file has no list_url"))?,
-                file.item_id
-                    .as_deref()
-                    .ok_or_else(|| PyRuntimeError::new_err("file has no item_id"))?
-            ),
-            None,
-        )
-    };
+    let (file_url, list_item_url) =
+        if let Some(path) = properties_server_relative_path(&file.properties, py) {
+            let file_url = format!(
+                "{}/GetFileByServerRelativePath(DecodedUrl={})",
+                state.web_url,
+                odata::literal(&path)
+            );
+            (
+                file_url.clone(),
+                Some(format!("{file_url}/ListItemAllFields")),
+            )
+        } else if let Some(unique_id) = &file.unique_id {
+            let file_url = format!("{}/GetFileById(guid'{}')", state.web_url, unique_id);
+            (
+                file_url.clone(),
+                Some(format!("{file_url}/ListItemAllFields")),
+            )
+        } else {
+            (
+                format!(
+                    "{}/items({})/File",
+                    file.list_url
+                        .as_deref()
+                        .ok_or_else(|| PyRuntimeError::new_err("file has no list_url"))?,
+                    file.item_id
+                        .as_deref()
+                        .ok_or_else(|| PyRuntimeError::new_err("file has no item_id"))?
+                ),
+                None,
+            )
+        };
     Ok(pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
         let file_data = state.get_json(&file_url, None).await?;
-        let path = odata::string(&file_data, "ServerRelativeUrl");
         Python::attach(|py| merge_properties(py, &properties, &file_data))?;
         if let Some(url) = list_item_url {
             let params = [(
@@ -740,7 +771,7 @@ fn start_file_resolution(
             let list_item_data = state.get_json(&url, Some(&params)).await?;
             Python::attach(|py| merge_properties(py, &properties, &list_item_data))?;
         }
-        Ok(path)
+        Ok(())
     }))
 }
 
@@ -751,15 +782,12 @@ async fn resolve_file(file: &Py<SPFile>) -> PyResult<(Arc<ClientState>, String)>
         Ok::<_, PyErr>((state, file.resolve_task.take()))
     })?;
     if let Some(task) = task {
-        let resolved_path = task.await.map_err(runtime_error)??;
-        Python::attach(|py| {
-            let mut file = file.bind(py).borrow_mut();
-            if resolved_path.is_some() {
-                file.server_relative_path = resolved_path;
-            }
-        });
+        task.await.map_err(runtime_error)??;
     }
-    let path = Python::attach(|py| file.bind(py).borrow().server_relative_path.clone());
+    let path = Python::attach(|py| {
+        let file = file.bind(py).borrow();
+        properties_server_relative_path(&file.properties, py)
+    });
     path.map(|path| (state, path)).ok_or_else(|| {
         PyRuntimeError::new_err("file has no server_relative_path even after resolving")
     })
@@ -778,12 +806,15 @@ impl SPFile {
         item_id: Option<String>,
         unique_id: Option<String>,
     ) -> PyResult<Py<Self>> {
+        let properties = properties.unwrap_or_else(|| PyDict::new(py).unbind());
+        if let Some(path) = server_relative_path {
+            properties.bind(py).set_item("ServerRelativeUrl", path)?;
+        }
         let file = Py::new(
             py,
             Self {
                 client,
-                server_relative_path,
-                properties: properties.unwrap_or_else(|| PyDict::new(py).unbind()),
+                properties,
                 list_url,
                 item_id,
                 unique_id,
@@ -854,11 +885,6 @@ impl SPFile {
     }
 
     fn get_url(&self, py: Python<'_>) -> PyResult<String> {
-        if self.server_relative_path.is_none() {
-            return Err(PyRuntimeError::new_err(
-                "file has no server_relative_path even after resolving",
-            ));
-        }
         let uri: String = self
             .properties
             .bind(py)
@@ -882,10 +908,38 @@ impl SPFile {
     }
 
     fn browser_url(&self, py: Python<'_>) -> PyResult<String> {
-        let path = self.server_relative_path.as_deref().ok_or_else(|| {
+        let path = properties_server_relative_path(&self.properties, py).ok_or_else(|| {
             PyRuntimeError::new_err("file has no server_relative_path even after resolving")
         })?;
-        browser_url(&self.client.bind(py).borrow().state.site_url, path, true)
+        browser_url(&self.client.bind(py).borrow().state.site_url, &path, true)
+    }
+
+    /// Returns `ServerRedirectedEmbedUri` if present, otherwise builds a Doc.aspx preview
+    /// link from the file's GUID (`UniqueId`, else `ContentTag`/`ETag`).
+    fn embed_url(&self, py: Python<'_>) -> PyResult<String> {
+        if let Some(value) = self
+            .properties
+            .bind(py)
+            .get_item("ServerRedirectedEmbedUri")?
+            && value.is_truthy()?
+        {
+            return value.extract();
+        }
+        let guid = properties_embed_guid(&self.properties, py)?.ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "file has no ServerRedirectedEmbedUri, UniqueId, ContentTag, or ETag to build an embed url",
+            )
+        })?;
+        let site_url = self.client.bind(py).borrow().state.site_url.clone();
+        let mut url = url::Url::parse(&site_url).map_err(runtime_error)?;
+        url.set_path(&format!(
+            "{}/_layouts/15/Doc.aspx",
+            url.path().trim_end_matches('/')
+        ));
+        url.query_pairs_mut()
+            .append_pair("sourcedoc", &format!("{{{guid}}}"))
+            .append_pair("action", "interactivepreview");
+        Ok(url.into())
     }
 }
 
@@ -1018,7 +1072,6 @@ fn item_from_value(
         py,
         SPFile {
             client,
-            server_relative_path: None,
             properties,
             list_url: Some(list_url),
             item_id: Some(id),
@@ -1349,12 +1402,15 @@ impl SharePointClient {
             FileLocator::Path(path) => (Some(path), None),
             FileLocator::Id(id) => (None, Some(id)),
         };
+        let properties = PyDict::new(py).unbind();
+        if let Some(path) = &server_relative_path {
+            properties.bind(py).set_item("ServerRelativeUrl", path)?;
+        }
         let file = Py::new(
             py,
             SPFile {
                 client: slf,
-                server_relative_path,
-                properties: PyDict::new(py).unbind(),
+                properties,
                 list_url: None,
                 item_id: None,
                 unique_id,
@@ -1478,7 +1534,6 @@ impl SharePointClient {
                     py,
                     SPFile {
                         client,
-                        server_relative_path: odata::string(&data, "ServerRelativeUrl"),
                         properties: value_dict(py, &data)?,
                         list_url: None,
                         item_id: None,
