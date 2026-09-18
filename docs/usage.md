@@ -174,6 +174,32 @@ Items returned by a list query start resolving their additional properties immed
 background. Methods such as `download()` wait for that work when necessary; call `resolve()`
 explicitly before synchronously reading a property or generating a link that depends on it.
 
+### Streaming downloads
+
+For large files, avoid buffering the whole file in memory by downloading directly to disk:
+
+```python
+await client.download_file("/sites/Team/Documents/Reports/summary.xlsx", "summary.xlsx")
+
+# Or, from an already-resolved SPFile, no path argument is needed:
+await file.download_file("summary.xlsx")
+```
+
+Both take chunks over HTTP `Range` requests internally. To process the file chunk-by-chunk
+yourself instead, use the async context manager and its `get_chunk()` method, which returns
+`None` once the file has been fully read:
+
+```python
+async with client.download_chunks("/sites/Team/Documents/Reports/summary.xlsx") as download:
+    while (chunk := await download.get_chunk()) is not None:
+        handle(chunk)
+
+# Or, from an already-resolved SPFile:
+async with file.download_chunks() as download:
+    while (chunk := await download.get_chunk()) is not None:
+        handle(chunk)
+```
+
 ## Upload files and create folders
 
 ```python
@@ -182,8 +208,7 @@ print(folder.get_url())
 
 with open("results.csv", "rb") as source:
     uploaded = await client.upload(
-        "/sites/Team/Documents/Exports",
-        "results.csv",
+        "/sites/Team/Documents/Exports/results.csv",
         source.read(),
         overwrite=True,
     )
@@ -193,6 +218,23 @@ print(uploaded.properties["ServerRelativeUrl"])
 
 Set `overwrite=False` on `upload()` to reject an existing filename. `add_folder()` also accepts
 `overwrite=True` when an existing folder should be accepted.
+
+### Streaming uploads
+
+To upload a local file without buffering it in memory, use `upload_file()`:
+
+```python
+await client.upload_file("/sites/Team/Documents/Exports/results.csv", "results.csv")
+```
+
+To write chunks yourself instead, use the async context manager returned by `upload_chunks()`
+and call `write()` once per chunk, in order:
+
+```python
+async with client.upload_chunks("/sites/Team/Documents/Exports/results.csv") as upload:
+    for chunk in chunks:
+        await upload.write(chunk)
+```
 
 ## Search, users, and permissions
 

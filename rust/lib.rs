@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::{AbortHandle, JoinSet};
 
 mod auth;
@@ -18,6 +19,7 @@ use crate::auth::CertificateCredential;
 use crate::http::{ClientState, runtime_error};
 
 const UPLOAD_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+const DOWNLOAD_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const SHAREPOINT_PATH_ENCODE: &AsciiSet =
     &CONTROLS.add(b' ').add(b'"').add(b'<').add(b'>').add(b'`');
 
@@ -874,13 +876,40 @@ impl SPFile {
     fn download<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let (state, path) = resolve_file(&slf).await?;
-            let url = format!(
-                "{}/GetFileByServerRelativePath(DecodedUrl={})/$value",
-                state.web_url,
-                odata::literal(&path)
-            );
+            let url = download_url(&state, FileLocator::Path(path));
             let content = state.get_bytes(&url).await?;
             Python::attach(|py| Ok(PyBytes::new(py, &content).unbind()))
+        })
+    }
+
+    /// Async context manager streaming this file's contents in `Range`-request chunks;
+    /// use `async with file.download_chunks() as session:` and `await session.get_chunk()`.
+    fn download_chunks(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<DownloadChunks>> {
+        Py::new(
+            py,
+            DownloadChunks {
+                state: None,
+                url: None,
+                pending_file: Some(slf),
+                position: 0,
+                total: None,
+                finished: false,
+            },
+        )
+    }
+
+    /// Downloads this file to `local_path`, streaming it in chunks instead of buffering it
+    /// in memory. Returns `None`.
+    fn download_file<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        local_path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (state, path) = resolve_file(&slf).await?;
+            let url = download_url(&state, FileLocator::Path(path));
+            download_url_to_file(&state, &url, &local_path).await?;
+            Python::attach(|py| Ok(py.None()))
         })
     }
 
@@ -1196,6 +1225,357 @@ fn get_items_awaitable<'py>(
     })
 }
 
+/// Splits `full_path` (e.g. `/sites/team/Documents/report.txt`) into its folder path and filename.
+fn split_full_path(full_path: &str) -> PyResult<(String, String)> {
+    match full_path.rsplit_once('/') {
+        Some((folder_path, filename)) => Ok((browser_path(folder_path)?, filename.to_owned())),
+        None => Err(PyValueError::new_err("Invalid full_path")),
+    }
+}
+
+fn download_url(state: &ClientState, locator: FileLocator) -> String {
+    match locator {
+        FileLocator::Path(path) => format!(
+            "{}/GetFileByServerRelativePath(DecodedUrl={})/$value",
+            state.web_url,
+            odata::literal(&path)
+        ),
+        FileLocator::Id(id) => format!("{}/GetFileById(guid'{}')/$value", state.web_url, id),
+    }
+}
+
+async fn chunked_upload_add(
+    state: &ClientState,
+    add_url: &str,
+    content: Vec<u8>,
+) -> PyResult<Value> {
+    Ok(state.post_json(add_url, None, Some(content)).await?)
+}
+
+async fn chunked_upload_start(
+    state: &ClientState,
+    add_url: &str,
+    file_url: &str,
+    upload_id: &str,
+    chunk: Vec<u8>,
+) -> PyResult<usize> {
+    state.post_json(add_url, None, Some(Vec::new())).await?;
+    let len = chunk.len();
+    state
+        .post_json(
+            &format!(
+                "{file_url}/startUpload(uploadID={})",
+                odata::literal(upload_id)
+            ),
+            None,
+            Some(chunk),
+        )
+        .await?;
+    Ok(len)
+}
+
+async fn chunked_upload_continue(
+    state: &ClientState,
+    file_url: &str,
+    upload_id: &str,
+    position: usize,
+    chunk: Vec<u8>,
+) -> PyResult<usize> {
+    let len = chunk.len();
+    state
+        .post_json(
+            &format!(
+                "{file_url}/continueUpload(uploadID={},fileOffset={position})",
+                odata::literal(upload_id)
+            ),
+            None,
+            Some(chunk),
+        )
+        .await?;
+    Ok(position + len)
+}
+
+async fn chunked_upload_finish(
+    state: &ClientState,
+    file_url: &str,
+    upload_id: &str,
+    position: usize,
+    chunk: Vec<u8>,
+) -> PyResult<Value> {
+    Ok(state
+        .post_json(
+            &format!(
+                "{file_url}/finishUpload(uploadID={},fileOffset={position})",
+                odata::literal(upload_id)
+            ),
+            None,
+            Some(chunk),
+        )
+        .await?)
+}
+
+async fn download_url_to_file(state: &ClientState, url: &str, local_path: &str) -> PyResult<()> {
+    let mut file = tokio::fs::File::create(local_path)
+        .await
+        .map_err(runtime_error)?;
+    let mut position: u64 = 0;
+    let mut total: Option<u64> = None;
+    loop {
+        let end = position + DOWNLOAD_CHUNK_SIZE - 1;
+        let (data, content_total) = state.get_bytes_range(url, position, end).await?;
+        if data.is_empty() {
+            break;
+        }
+        file.write_all(&data).await.map_err(runtime_error)?;
+        total = total.or(content_total);
+        position += data.len() as u64;
+        if (data.len() as u64) < DOWNLOAD_CHUNK_SIZE || total.is_some_and(|value| position >= value)
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn upload_file_to_folder(
+    state: &ClientState,
+    folder_url: &str,
+    filename: &str,
+    overwrite: bool,
+    local_path: &str,
+) -> PyResult<()> {
+    let add_url = format!(
+        "{folder_url}/Files/add(url={},overwrite={})",
+        odata::literal(filename),
+        odata::bool_literal(overwrite)
+    );
+    let file_url = format!("{folder_url}/Files({})", odata::literal(filename));
+    let upload_id = uuid::Uuid::new_v4().to_string();
+    let mut source = tokio::fs::File::open(local_path)
+        .await
+        .map_err(runtime_error)?;
+    let mut buffer = vec![0u8; UPLOAD_CHUNK_SIZE];
+    let mut pending: Option<Vec<u8>> = None;
+    let mut started = false;
+    let mut position = 0usize;
+    loop {
+        let read = source.read(&mut buffer).await.map_err(runtime_error)?;
+        if read == 0 {
+            break;
+        }
+        if let Some(previous) = pending.replace(buffer[..read].to_vec()) {
+            if started {
+                position =
+                    chunked_upload_continue(state, &file_url, &upload_id, position, previous)
+                        .await?;
+            } else {
+                position =
+                    chunked_upload_start(state, &add_url, &file_url, &upload_id, previous).await?;
+                started = true;
+            }
+        }
+    }
+    match pending {
+        Some(chunk) if started => {
+            chunked_upload_finish(state, &file_url, &upload_id, position, chunk).await?;
+        }
+        Some(chunk) => {
+            chunked_upload_add(state, &add_url, chunk).await?;
+        }
+        None => {
+            chunked_upload_add(state, &add_url, Vec::new()).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Async context manager returned by `upload_chunks`; `write()` streams one chunk at a time,
+/// buffering the most recent chunk so the final `write` (or `__aexit__`) can be sent as
+/// SharePoint's `finishUpload` (or, for a single-chunk upload, a plain `Files/add`).
+#[pyclass(module = "async_sharepoint")]
+struct UploadChunks {
+    state: Arc<ClientState>,
+    add_url: String,
+    file_url: String,
+    upload_id: String,
+    position: usize,
+    started: bool,
+    pending: Option<Vec<u8>>,
+    closed: bool,
+}
+
+#[pymethods]
+impl UploadChunks {
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(slf) })
+    }
+
+    fn write<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        chunk: &Bound<'_, PyBytes>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let chunk = chunk.as_bytes().to_vec();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (state, add_url, file_url, upload_id, position, started, previous) =
+                Python::attach(|py| {
+                    let mut session = slf.bind(py).borrow_mut();
+                    let previous = session.pending.replace(chunk);
+                    (
+                        Arc::clone(&session.state),
+                        session.add_url.clone(),
+                        session.file_url.clone(),
+                        session.upload_id.clone(),
+                        session.position,
+                        session.started,
+                        previous,
+                    )
+                });
+            let Some(previous) = previous else {
+                return Ok(());
+            };
+            let new_position = if started {
+                chunked_upload_continue(&state, &file_url, &upload_id, position, previous).await?
+            } else {
+                chunked_upload_start(&state, &add_url, &file_url, &upload_id, previous).await?
+            };
+            Python::attach(|py| {
+                let mut session = slf.bind(py).borrow_mut();
+                session.started = true;
+                session.position = new_position;
+            });
+            Ok(())
+        })
+    }
+
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        exc_type: Py<PyAny>,
+        _exc_value: Py<PyAny>,
+        _traceback: Py<PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let has_exception = !exc_type.is_none(py);
+        let state = Arc::clone(&self.state);
+        let add_url = self.add_url.clone();
+        let file_url = self.file_url.clone();
+        let upload_id = self.upload_id.clone();
+        let position = self.position;
+        let started = self.started;
+        let pending = self.pending.clone();
+        let closed = self.closed;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if closed || has_exception {
+                return Ok(false);
+            }
+            match pending {
+                Some(chunk) if started => {
+                    chunked_upload_finish(&state, &file_url, &upload_id, position, chunk).await?;
+                }
+                Some(chunk) => {
+                    chunked_upload_add(&state, &add_url, chunk).await?;
+                }
+                None if !started => {
+                    chunked_upload_add(&state, &add_url, Vec::new()).await?;
+                }
+                None => {}
+            }
+            Ok(false)
+        })
+    }
+}
+
+/// Async context manager returned by `download_chunks`; `get_chunk()` streams one range at a
+/// time from SharePoint's `/$value` endpoint (via HTTP `Range` requests) and returns `None`
+/// once the file has been fully read.
+#[pyclass(module = "async_sharepoint")]
+struct DownloadChunks {
+    state: Option<Arc<ClientState>>,
+    url: Option<String>,
+    pending_file: Option<Py<SPFile>>,
+    position: u64,
+    total: Option<u64>,
+    finished: bool,
+}
+
+#[pymethods]
+impl DownloadChunks {
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pending_file = slf
+            .bind(py)
+            .borrow()
+            .pending_file
+            .as_ref()
+            .map(|file| file.clone_ref(py));
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Some(file) = pending_file {
+                let (state, path) = resolve_file(&file).await?;
+                let url = download_url(&state, FileLocator::Path(path));
+                Python::attach(|py| {
+                    let mut session = slf.bind(py).borrow_mut();
+                    session.state = Some(state);
+                    session.url = Some(url);
+                    session.pending_file = None;
+                });
+            }
+            Ok(slf)
+        })
+    }
+
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: Py<PyAny>,
+        _exc_value: Py<PyAny>,
+        _traceback: Py<PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async { Ok(false) })
+    }
+
+    fn get_chunk<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let (state, url, position, total, finished) = Python::attach(|py| {
+            let session = slf.bind(py).borrow();
+            (
+                session.state.as_ref().map(Arc::clone),
+                session.url.clone(),
+                session.position,
+                session.total,
+                session.finished,
+            )
+        });
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if finished {
+                return Python::attach(|py| Ok(py.None()));
+            }
+            let state = state.ok_or_else(|| {
+                PyRuntimeError::new_err("download_chunks session was not entered")
+            })?;
+            let url = url.ok_or_else(|| {
+                PyRuntimeError::new_err("download_chunks session was not entered")
+            })?;
+            let end = position + DOWNLOAD_CHUNK_SIZE - 1;
+            let (data, content_total) = state.get_bytes_range(&url, position, end).await?;
+            let received = data.len() as u64;
+            let new_total = total.or(content_total);
+            let new_position = position + received;
+            let is_finished = received == 0
+                || received < DOWNLOAD_CHUNK_SIZE
+                || new_total.is_some_and(|value| new_position >= value);
+            Python::attach(|py| {
+                let mut session = slf.bind(py).borrow_mut();
+                session.position = new_position;
+                session.total = new_total;
+                session.finished = is_finished;
+            });
+            if data.is_empty() {
+                Python::attach(|py| Ok(py.None()))
+            } else {
+                Python::attach(|py| Ok(PyBytes::new(py, &data).into_any().unbind()))
+            }
+        })
+    }
+}
+
 #[pyclass(module = "async_sharepoint")]
 struct SharePointClient {
     state: Arc<ClientState>,
@@ -1436,32 +1816,58 @@ impl SharePointClient {
         let state = Arc::clone(&self.state);
         let locator = browser_file_locator(&path)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let url = match locator {
-                FileLocator::Path(path) => format!(
-                    "{}/GetFileByServerRelativePath(DecodedUrl={})/$value",
-                    state.web_url,
-                    odata::literal(&path)
-                ),
-                FileLocator::Id(id) => {
-                    format!("{}/GetFileById(guid'{}')/$value", state.web_url, id)
-                }
-            };
+            let url = download_url(&state, locator);
             let content = state.get_bytes(&url).await?;
             Python::attach(|py| Ok(PyBytes::new(py, &content).unbind()))
         })
     }
 
-    #[pyo3(signature = (folder_path, filename, content, *, overwrite=true))]
+    /// Async context manager streaming a file's contents in `Range`-request chunks;
+    /// use `async with client.download_chunks(path) as session:` and
+    /// `await session.get_chunk()` until it returns `None`.
+    fn download_chunks(&self, py: Python<'_>, path: String) -> PyResult<Py<DownloadChunks>> {
+        let locator = browser_file_locator(&path)?;
+        let url = download_url(&self.state, locator);
+        Py::new(
+            py,
+            DownloadChunks {
+                state: Some(Arc::clone(&self.state)),
+                url: Some(url),
+                pending_file: None,
+                position: 0,
+                total: None,
+                finished: false,
+            },
+        )
+    }
+
+    /// Downloads `path` to `local_path`, streaming it in chunks instead of buffering it in
+    /// memory. Returns `None`.
+    fn download_file<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        local_path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let state = Arc::clone(&self.state);
+        let locator = browser_file_locator(&path)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let url = download_url(&state, locator);
+            download_url_to_file(&state, &url, &local_path).await?;
+            Python::attach(|py| Ok(py.None()))
+        })
+    }
+
+    #[pyo3(signature = (full_path,  content, *, overwrite=true))]
     fn upload<'py>(
         &self,
         py: Python<'py>,
-        folder_path: String,
-        filename: String,
+        full_path: String,
         content: &Bound<'_, PyBytes>,
         overwrite: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&self.state);
-        let folder_path = browser_path(&folder_path)?;
+        let (folder_path, filename) = split_full_path(&full_path)?;
         let content = content.as_bytes().to_vec();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let folder_url = format!(
@@ -1475,48 +1881,30 @@ impl SharePointClient {
                 odata::bool_literal(overwrite)
             );
             let data = if content.len() <= UPLOAD_CHUNK_SIZE {
-                state.post_json(&add_url, None, Some(content)).await?
+                chunked_upload_add(&state, &add_url, content).await?
             } else {
-                state.post_json(&add_url, None, Some(Vec::new())).await?;
                 let file_url = format!("{folder_url}/Files({})", odata::literal(&filename));
                 let upload_id = uuid::Uuid::new_v4().to_string();
-                let mut position = UPLOAD_CHUNK_SIZE;
-                state
-                    .post_json(
-                        &format!(
-                            "{file_url}/startUpload(uploadID={})",
-                            odata::literal(&upload_id)
-                        ),
-                        None,
-                        Some(content[..UPLOAD_CHUNK_SIZE].to_vec()),
-                    )
-                    .await?;
+                let mut position = chunked_upload_start(
+                    &state,
+                    &add_url,
+                    &file_url,
+                    &upload_id,
+                    content[..UPLOAD_CHUNK_SIZE].to_vec(),
+                )
+                .await?;
                 loop {
                     let end = (position + UPLOAD_CHUNK_SIZE).min(content.len());
                     let chunk = content[position..end].to_vec();
                     if end < content.len() {
-                        state
-                            .post_json(
-                                &format!(
-                                    "{file_url}/continueUpload(uploadID={},fileOffset={position})",
-                                    odata::literal(&upload_id)
-                                ),
-                                None,
-                                Some(chunk),
-                            )
-                            .await?;
-                        position = end;
+                        position =
+                            chunked_upload_continue(&state, &file_url, &upload_id, position, chunk)
+                                .await?;
                     } else {
-                        break state
-                            .post_json(
-                                &format!(
-                                    "{file_url}/finishUpload(uploadID={},fileOffset={position})",
-                                    odata::literal(&upload_id)
-                                ),
-                                None,
-                                Some(chunk),
-                            )
-                            .await?;
+                        break chunked_upload_finish(
+                            &state, &file_url, &upload_id, position, chunk,
+                        )
+                        .await?;
                     }
                 }
             };
@@ -1547,6 +1935,66 @@ impl SharePointClient {
             })?;
             resolve_file(&file).await?;
             Ok(file)
+        })
+    }
+
+    /// Async context manager streaming a file upload one chunk at a time; use
+    /// `async with client.upload_chunks(full_path, overwrite=...) as session:` and
+    /// `await session.write(chunk)` for each chunk.
+    #[pyo3(signature = (full_path, *, overwrite=true))]
+    fn upload_chunks(
+        &self,
+        py: Python<'_>,
+        full_path: String,
+        overwrite: bool,
+    ) -> PyResult<Py<UploadChunks>> {
+        let (folder_path, filename) = split_full_path(&full_path)?;
+        let folder_url = format!(
+            "{}/GetFolderByServerRelativeUrl({})",
+            self.state.web_url,
+            odata::literal(&folder_path)
+        );
+        let add_url = format!(
+            "{folder_url}/Files/add(url={},overwrite={})",
+            odata::literal(&filename),
+            odata::bool_literal(overwrite)
+        );
+        let file_url = format!("{folder_url}/Files({})", odata::literal(&filename));
+        Py::new(
+            py,
+            UploadChunks {
+                state: Arc::clone(&self.state),
+                add_url,
+                file_url,
+                upload_id: uuid::Uuid::new_v4().to_string(),
+                position: 0,
+                started: false,
+                pending: None,
+                closed: false,
+            },
+        )
+    }
+
+    /// Uploads `local_path` to `full_path`, streaming it in chunks instead of buffering it
+    /// in memory. Returns `None`.
+    #[pyo3(signature = (full_path, local_path, *, overwrite=true))]
+    fn upload_file<'py>(
+        &self,
+        py: Python<'py>,
+        full_path: String,
+        local_path: String,
+        overwrite: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let state = Arc::clone(&self.state);
+        let (folder_path, filename) = split_full_path(&full_path)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let folder_url = format!(
+                "{}/GetFolderByServerRelativeUrl({})",
+                state.web_url,
+                odata::literal(&folder_path)
+            );
+            upload_file_to_folder(&state, &folder_url, &filename, overwrite, &local_path).await?;
+            Python::attach(|py| Ok(py.None()))
         })
     }
 
@@ -1763,6 +2211,8 @@ fn async_sharepoint(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SPFile>()?;
     module.add_class::<SPFolder>()?;
     module.add_class::<SPList>()?;
+    module.add_class::<UploadChunks>()?;
+    module.add_class::<DownloadChunks>()?;
     let sp_item = module
         .getattr("SPFile")?
         .call_method1("__or__", (module.getattr("SPFolder")?,))?

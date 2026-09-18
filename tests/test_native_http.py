@@ -216,9 +216,9 @@ async def test_native_sharepoint_operations() -> None:
             assert await caml_remaining == []
 
             assert await client.download("/sites/team/Documents/report.txt") == b"report-content"
-            uploaded = await client.upload("/sites/team/Documents", "upload.txt", b"uploaded content")
+            uploaded = await client.upload("/sites/team/Documents/upload.txt", b"uploaded content")
             assert uploaded.properties["ServerRelativeUrl"] == "/sites/team/Documents/upload.txt"
-            large = await client.upload("/sites/team/Documents", "large.bin", b"x" * (8 * 1024 * 1024 + 1))
+            large = await client.upload("/sites/team/Documents/large.bin", b"x" * (8 * 1024 * 1024 + 1))
             assert large.properties["ServerRelativeUrl"] == "/sites/team/Documents/large.bin"
             upload_requests = [
                 (path, body)
@@ -231,3 +231,37 @@ async def test_native_sharepoint_operations() -> None:
             assert (await client.get_current_user())["LoginName"] == "user@example.test"
             assert (await client.get_effective_permissions("/sites/team/Documents"))["High"] == "16"
             assert (await client.search("quarterly", title="Documents"))[0]["Title"] == "Quarterly report"
+
+
+@pytest.mark.asyncio
+async def test_chunked_and_file_helpers(tmp_path) -> None:
+    with sharepoint_server() as site_url:
+        async with SharePointClient.from_static_token(site_url, "test-token") as client:
+            async with client.upload_chunks("/sites/team/Documents/chunked.txt") as upload:
+                await upload.write(b"hello ")
+                await upload.write(b"world")
+
+            async with client.download_chunks("/sites/team/Documents/report.txt") as download:
+                chunks = []
+                while (chunk := await download.get_chunk()) is not None:
+                    chunks.append(chunk)
+                assert b"".join(chunks) == b"report-content"
+
+            local_download = tmp_path / "downloaded.txt"
+            assert await client.download_file("/sites/team/Documents/report.txt", str(local_download)) is None
+            assert local_download.read_bytes() == b"report-content"
+
+            file = await client.get_file("/sites/team/Documents/report.txt")
+            local_file_download = tmp_path / "downloaded2.txt"
+            assert await file.download_file(str(local_file_download)) is None
+            assert local_file_download.read_bytes() == b"report-content"
+
+            async with file.download_chunks() as download:
+                chunks = []
+                while (chunk := await download.get_chunk()) is not None:
+                    chunks.append(chunk)
+                assert b"".join(chunks) == b"report-content"
+
+            local_upload = tmp_path / "to_upload.bin"
+            local_upload.write_bytes(b"y" * (8 * 1024 * 1024 + 1))
+            assert await client.upload_file("/sites/team/Documents/upload_from_file.bin", str(local_upload)) is None

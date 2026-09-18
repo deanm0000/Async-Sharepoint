@@ -181,6 +181,34 @@ class SPFile:
         >>> content = await file.download()
         """
         ...
+    def download_chunks(self) -> DownloadChunks:
+        """Open an async context manager that streams this file's contents in chunks.
+
+        Returns
+        -------
+        DownloadChunks
+            Async context manager exposing ``get_chunk()``.
+
+        Examples
+        --------
+        >>> async with file.download_chunks() as download:
+        ...     while (chunk := await download.get_chunk()) is not None:
+        ...         handle(chunk)
+        """
+        ...
+    async def download_file(self, local_path: str) -> None:
+        """Download the file to a local path, streaming it instead of buffering it in memory.
+
+        Parameters
+        ----------
+        local_path : str
+            Local filesystem path to write the file to.
+
+        Examples
+        --------
+        >>> await file.download_file("/tmp/report.xlsx")
+        """
+        ...
     def get_url(self) -> str:
         """Return SharePoint's preferred URL for the file.
 
@@ -304,6 +332,52 @@ class SPList:
         """
         ...
     def __getattr__(self, name: str) -> Any: ...
+
+class UploadChunks:
+    """Async context manager returned by ``SharePointClient.upload_chunks``.
+
+    Examples
+    --------
+    >>> async with client.upload_chunks("/sites/Team/Documents/report.txt") as upload:
+    ...     await upload.write(chunk_one)
+    ...     await upload.write(chunk_two)
+    """
+
+    async def __aenter__(self) -> UploadChunks: ...
+    async def __aexit__(self, *exc_info: object) -> None: ...
+    async def write(self, chunk: bytes) -> None:
+        """Write the next chunk of the file being uploaded.
+
+        Parameters
+        ----------
+        chunk : bytes
+            Next chunk of binary file content, in order.
+        """
+        ...
+
+class DownloadChunks:
+    """Async context manager returned by ``SharePointClient.download_chunks`` and
+    ``SPFile.download_chunks``.
+
+    Examples
+    --------
+    >>> async with client.download_chunks("/sites/Team/Documents/report.txt") as download:
+    ...     while (chunk := await download.get_chunk()) is not None:
+    ...         handle(chunk)
+    """
+
+    async def __aenter__(self) -> DownloadChunks: ...
+    async def __aexit__(self, *exc_info: object) -> None: ...
+    async def get_chunk(self) -> bytes | None:
+        """Fetch the next chunk of the file's contents.
+
+        Returns
+        -------
+        bytes or None
+            Next chunk of binary file content, or ``None`` once the file has been
+            fully read.
+        """
+        ...
 
 class SharePointClient:
     """Asynchronous client for a SharePoint site.
@@ -550,8 +624,7 @@ class SharePointClient:
         ...
     async def upload(
         self,
-        folder_path: str,
-        filename: str,
+        full_path: str,
         content: bytes,
         *,
         overwrite: bool = True,
@@ -560,10 +633,8 @@ class SharePointClient:
 
         Parameters
         ----------
-        folder_path : str
-            Server-relative destination folder path.
-        filename : str
-            Destination filename.
+        full_path : str
+            Server-relative destination path, including the filename.
         content : bytes
             Binary file content.
         overwrite : bool, optional
@@ -577,10 +648,85 @@ class SharePointClient:
         Examples
         --------
         >>> uploaded = await client.upload(
-        ...     "/sites/Team/Documents",
-        ...     "report.txt",
+        ...     "/sites/Team/Documents/report.txt",
         ...     b"report contents",
         ... )
+        """
+        ...
+    def upload_chunks(self, full_path: str, *, overwrite: bool = True) -> UploadChunks:
+        """Open an async context manager that uploads a file one chunk at a time.
+
+        Parameters
+        ----------
+        full_path : str
+            Server-relative destination path, including the filename.
+        overwrite : bool, optional
+            Whether to replace an existing file. Defaults to ``True``.
+
+        Returns
+        -------
+        UploadChunks
+            Async context manager exposing ``write(chunk)``.
+
+        Examples
+        --------
+        >>> async with client.upload_chunks("/sites/Team/Documents/report.txt") as upload:
+        ...     await upload.write(b"first chunk")
+        ...     await upload.write(b"last chunk")
+        """
+        ...
+    async def upload_file(self, full_path: str, local_path: str, *, overwrite: bool = True) -> None:
+        """Upload a local file to a SharePoint folder, streaming it instead of buffering it in memory.
+
+        Parameters
+        ----------
+        full_path : str
+            Server-relative destination path, including the filename.
+        local_path : str
+            Local filesystem path of the file to upload.
+        overwrite : bool, optional
+            Whether to replace an existing file. Defaults to ``True``.
+
+        Examples
+        --------
+        >>> await client.upload_file("/sites/Team/Documents/report.xlsx", "/tmp/report.xlsx")
+        """
+        ...
+    def download_chunks(self, path: str) -> DownloadChunks:
+        """Open an async context manager that streams a file's contents in chunks.
+
+        Parameters
+        ----------
+        path : str
+            Server-relative path, ``AllItems.aspx?id=...`` URL, or
+            ``Doc.aspx?sourcedoc=...`` URL.
+
+        Returns
+        -------
+        DownloadChunks
+            Async context manager exposing ``get_chunk()``.
+
+        Examples
+        --------
+        >>> async with client.download_chunks("/sites/Team/Documents/report.xlsx") as download:
+        ...     while (chunk := await download.get_chunk()) is not None:
+        ...         handle(chunk)
+        """
+        ...
+    async def download_file(self, path: str, local_path: str) -> None:
+        """Download a SharePoint file to a local path, streaming it instead of buffering it in memory.
+
+        Parameters
+        ----------
+        path : str
+            Server-relative path, ``AllItems.aspx?id=...`` URL, or
+            ``Doc.aspx?sourcedoc=...`` URL.
+        local_path : str
+            Local filesystem path to write the file to.
+
+        Examples
+        --------
+        >>> await client.download_file("/sites/Team/Documents/report.xlsx", "/tmp/report.xlsx")
         """
         ...
     async def add_folder(self, path: str, *, overwrite: bool = False) -> SPFolder:

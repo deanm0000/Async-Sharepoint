@@ -55,7 +55,15 @@ The client is an async context manager. Its public methods are:
 `path` accepts a server-relative path, an `AllItems.aspx?id=...` browser link, or a
 `Doc.aspx?sourcedoc={GUID}` browser/share link (resolved via the file's unique id).
 
-- `await upload(folder_path, filename, content, *, overwrite=True)`
+- `await download_chunks(path)` returns an async context manager exposing `await get_chunk()`,
+  which streams the file via HTTP `Range` requests and returns `None` once fully read.
+- `await download_file(path, local_path)` downloads directly to `local_path` in chunks
+  without buffering the whole file in memory. Returns `None`.
+- `await upload(full_path, content, *, overwrite=True)`
+- `upload_chunks(full_path, *, overwrite=True)` returns an async context manager exposing
+  `await write(chunk)` for each chunk of the upload, in order.
+- `await upload_file(full_path, local_path, *, overwrite=True)` uploads a local file in chunks
+  without buffering it in memory. Returns `None`.
 - `await add_folder(path, *, overwrite=False)`
 - `await get_current_user()`
 - `await get_effective_permissions(path, *, login_name=None)`
@@ -65,8 +73,10 @@ The client is an async context manager. Its public methods are:
 
 File values expose `client`, `properties`,
 `list_url`, `item_id`, `unique_id`, and `resolved` (a read-only property that is true once
-resolution has completed). Their public methods are `resolve`, `download`, `get_url`,
-`browser_url`, and `embed_url`.
+resolution has completed). Their public methods are `resolve`, `download`, `download_chunks`,
+`download_file`, `get_url`, `browser_url`, and `embed_url`. `download_chunks()` and
+`download_file(local_path)` mirror the client's methods but need no `path` argument since the
+file is already resolved.
 
 ## SPFolder
 

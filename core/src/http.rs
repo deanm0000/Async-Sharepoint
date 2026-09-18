@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::{ACCEPT, AUTHORIZATION, RETRY_AFTER};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, RANGE, RETRY_AFTER};
 use reqwest::{Method, Response, StatusCode};
 use serde_json::Value;
 use tokio::runtime::Handle;
@@ -81,6 +81,7 @@ impl ClientState {
         params: Option<&[(String, String)]>,
         json_body: Option<&Value>,
         content: Option<Vec<u8>>,
+        range: Option<(u64, u64)>,
     ) -> Result<Response> {
         let mut stale = None;
         for attempt in 0..=MAX_RETRIES {
@@ -97,7 +98,14 @@ impl ClientState {
                 request = request.json(json_body);
             }
             if let Some(content) = &content {
-                request = request.body(content.clone());
+                // IIS returns 411 Length Required if Content-Length is missing, including for
+                // an empty body; reqwest doesn't reliably send it on its own for zero-length bodies.
+                request = request
+                    .header(CONTENT_LENGTH, content.len())
+                    .body(content.clone());
+            }
+            if let Some((start, end)) = range {
+                request = request.header(RANGE, format!("bytes={start}-{end}"));
             }
             let response = request.send().await?;
             let status = response.status();
@@ -140,7 +148,7 @@ impl ClientState {
 
     pub async fn get_json(&self, url: &str, params: Option<&[(String, String)]>) -> Result<Value> {
         Ok(self
-            .request(Method::GET, url, params, None, None)
+            .request(Method::GET, url, params, None, None, None)
             .await?
             .json()
             .await?)
@@ -152,7 +160,7 @@ impl ClientState {
         content: Option<Vec<u8>>,
     ) -> Result<Value> {
         let response = self
-            .request(Method::POST, url, None, json_body, content)
+            .request(Method::POST, url, None, json_body, content, None)
             .await?;
         let body = response.bytes().await?;
         Ok(if body.is_empty() {
@@ -163,11 +171,31 @@ impl ClientState {
     }
     pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
         Ok(self
-            .request(Method::GET, url, None, None, None)
+            .request(Method::GET, url, None, None, None, None)
             .await?
             .bytes()
             .await?
             .to_vec())
+    }
+
+    /// Fetch one byte range (`bytes=start-end`, inclusive) of a file's `/$value` endpoint,
+    /// returning the chunk plus the total file size when the server reports `Content-Range`.
+    pub async fn get_bytes_range(
+        &self,
+        url: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(Vec<u8>, Option<u64>)> {
+        let response = self
+            .request(Method::GET, url, None, None, None, Some((start, end)))
+            .await?;
+        let total = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.rsplit('/').next())
+            .and_then(|value| value.parse::<u64>().ok());
+        Ok((response.bytes().await?.to_vec(), total))
     }
 }
 
