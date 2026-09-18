@@ -1832,7 +1832,11 @@ impl SharePointClient {
         })
     }
 
-    fn download<'py>(&self, py: Python<'py>, path: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    fn download<'py>(
+        &self,
+        py: Python<'py>,
+        path: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&self.state);
         let locator = file_locator_from_py(&path)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1845,7 +1849,11 @@ impl SharePointClient {
     /// Async context manager streaming a file's contents in `Range`-request chunks;
     /// use `async with client.download_chunks(path) as session:` and
     /// `await session.get_chunk()` until it returns `None`.
-    fn download_chunks(&self, py: Python<'_>, path: Bound<'_, PyAny>) -> PyResult<Py<DownloadChunks>> {
+    fn download_chunks(
+        &self,
+        py: Python<'_>,
+        path: Bound<'_, PyAny>,
+    ) -> PyResult<Py<DownloadChunks>> {
         let locator = file_locator_from_py(&path)?;
         let url = download_url(&self.state, locator);
         Py::new(
