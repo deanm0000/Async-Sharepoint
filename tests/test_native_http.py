@@ -137,6 +137,7 @@ class SharePointHandler(BaseHTTPRequestHandler):
         elif "/finishUpload(" in path:
             self.send_json({"ServerRelativeUrl": "/sites/team/Documents/large.bin"})
         elif "/Folders/AddUsingPath(" in path:
+            assert self.headers["Content-Length"] == "0"
             self.send_json({"ServerRelativeUrl": "/sites/team/Documents/New"})
         elif "/GetUserEffectivePermissions(" in path:
             self.send_json({"High": "16", "Low": "0"})

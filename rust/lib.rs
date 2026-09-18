@@ -2042,7 +2042,7 @@ impl SharePointClient {
                 odata::literal(&path),
                 odata::bool_literal(overwrite)
             );
-            let data = state.post_json(&url, None, None).await?;
+            let data = state.post_json(&url, None, Some(Vec::new())).await?;
             Python::attach(|py| {
                 Py::new(
                     py,
