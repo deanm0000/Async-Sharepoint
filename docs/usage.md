@@ -159,6 +159,15 @@ sharing_link = (
 content = await client.download(sharing_link)
 ```
 
+A file's `UniqueId` (the same UUID found in a `sourcedoc` link) is also accepted directly, bare
+or `{braced}`:
+
+```python
+file = await client.get_file("01246A4B-84D7-49D6-8937-895D3C0F50A9")
+file = await client.get_file("{01246A4B-84D7-49D6-8937-895D3C0F50A9}")
+file = await client.get_file(UUID("01246A4B-84D7-49D6-8937-895D3C0F50A9"))
+```
+
 An `SPFile` can produce three useful SharePoint links. `get_url()` uses SharePoint's preferred URL
 for the file, `browser_url()` builds its document-library browsing URL, and `embed_url()` builds a
 preview/embed link:

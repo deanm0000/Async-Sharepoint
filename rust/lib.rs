@@ -62,9 +62,24 @@ enum FileLocator {
     Id(String),
 }
 
-/// Resolve a server-relative path, an AllItems browser URL (`?id=`), or a
+/// Resolves a Python `str` or `uuid.UUID` into a `FileLocator`, without round-tripping a
+/// `uuid.UUID` through string parsing back into a `uuid::Uuid`.
+fn file_locator_from_py(value: &Bound<'_, PyAny>) -> PyResult<FileLocator> {
+    let uuid_type = value.py().import("uuid")?.getattr("UUID")?;
+    if value.is_instance(&uuid_type)? {
+        return Ok(FileLocator::Id(value.str()?.extract()?));
+    }
+    browser_file_locator(&value.extract::<String>()?)
+}
+
+/// Resolve a server-relative path, a bare/braced UniqueId (as found in a
+/// "Doc.aspx" `sourcedoc` query parameter), an AllItems browser URL (`?id=`), or a
 /// "Doc.aspx" / OneDrive-style browser URL (`?sourcedoc={guid}`).
 fn browser_file_locator(path: &str) -> PyResult<FileLocator> {
+    let trimmed = path.trim_matches(|c| c == '{' || c == '}');
+    if let Ok(id) = trimmed.parse::<uuid::Uuid>() {
+        return Ok(FileLocator::Id(id.to_string()));
+    }
     if !path.starts_with("http://") && !path.starts_with("https://") {
         return Ok(FileLocator::Path(path.to_owned()));
     }
@@ -1776,8 +1791,13 @@ impl SharePointClient {
         get_items_awaitable(py, slf, title, id, caml, folder_path, max_wait)
     }
 
-    fn get_file<'py>(slf: Py<Self>, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
-        let locator = browser_file_locator(&path)?;
+    fn get_file<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        path: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let display = path.str()?.to_string();
+        let locator = file_locator_from_py(&path)?;
         let (server_relative_path, unique_id) = match locator {
             FileLocator::Path(path) => (Some(path), None),
             FileLocator::Id(id) => (None, Some(id)),
@@ -1803,7 +1823,7 @@ impl SharePointClient {
             if let Err(error) = resolve_file(&file).await {
                 if error.to_string().contains(" 404 ") {
                     return Err(PyRuntimeError::new_err(format!(
-                        "Either {path} does not exist or is a folder"
+                        "Either {display} does not exist or is a folder"
                     )));
                 }
                 return Err(error);
@@ -1812,9 +1832,9 @@ impl SharePointClient {
         })
     }
 
-    fn download<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+    fn download<'py>(&self, py: Python<'py>, path: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&self.state);
-        let locator = browser_file_locator(&path)?;
+        let locator = file_locator_from_py(&path)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let url = download_url(&state, locator);
             let content = state.get_bytes(&url).await?;
@@ -1825,8 +1845,8 @@ impl SharePointClient {
     /// Async context manager streaming a file's contents in `Range`-request chunks;
     /// use `async with client.download_chunks(path) as session:` and
     /// `await session.get_chunk()` until it returns `None`.
-    fn download_chunks(&self, py: Python<'_>, path: String) -> PyResult<Py<DownloadChunks>> {
-        let locator = browser_file_locator(&path)?;
+    fn download_chunks(&self, py: Python<'_>, path: Bound<'_, PyAny>) -> PyResult<Py<DownloadChunks>> {
+        let locator = file_locator_from_py(&path)?;
         let url = download_url(&self.state, locator);
         Py::new(
             py,
@@ -1846,11 +1866,11 @@ impl SharePointClient {
     fn download_file<'py>(
         &self,
         py: Python<'py>,
-        path: String,
+        path: Bound<'py, PyAny>,
         local_path: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&self.state);
-        let locator = browser_file_locator(&path)?;
+        let locator = file_locator_from_py(&path)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let url = download_url(&state, locator);
             download_url_to_file(&state, &url, &local_path).await?;

@@ -52,8 +52,9 @@ The client is an async context manager. Its public methods are:
 - `await ls()`
 - `await download(path)`
 
-`path` accepts a server-relative path, an `AllItems.aspx?id=...` browser link, or a
-`Doc.aspx?sourcedoc={GUID}` browser/share link (resolved via the file's unique id).
+`path` accepts a server-relative path, a bare or `{braced}` `UniqueId`, an `AllItems.aspx?id=...`
+browser link, or a `Doc.aspx?sourcedoc={GUID}` browser/share link (the latter two are also
+resolved via the file's `UniqueId`).
 
 - `await download_chunks(path)` returns an async context manager exposing `await get_chunk()`,
   which streams the file via HTTP `Range` requests and returns `None` once fully read.

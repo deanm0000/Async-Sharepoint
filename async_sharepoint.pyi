@@ -1,6 +1,7 @@
 from asyncio import Task
 from collections.abc import Awaitable
 from typing import Any, TypeAlias, overload
+from uuid import UUID
 
 class CertificateCredential:
     """Entra ID certificate credentials for SharePoint.
@@ -566,13 +567,13 @@ class SharePointClient:
         folder_path: str | None = None,
         max_wait: float,
     ) -> tuple[list[SPItem], Awaitable[list[SPItem]]]: ...
-    async def get_file(self, path: str) -> SPFile:
+    async def get_file(self, path: str | UUID) -> SPFile:
         """Get a resolved SharePoint file.
 
         Parameters
         ----------
-        path : str
-            Server-relative path, ``AllItems.aspx?id=...`` URL, or
+        path : str | UUID
+            Server-relative path, bare/braced UniqueId, ``AllItems.aspx?id=...`` URL, or
             ``Doc.aspx?sourcedoc=...`` URL.
 
         Returns
@@ -603,13 +604,13 @@ class SharePointClient:
         >>> root_items = await client.ls()
         """
         ...
-    async def download(self, path: str) -> bytes:
+    async def download(self, path: str | UUID) -> bytes:
         """Download a SharePoint file by path or browser URL.
 
         Parameters
         ----------
-        path : str
-            Server-relative path, ``AllItems.aspx?id=...`` URL, or
+        path : str | UUID
+            Server-relative path, bare/braced UniqueId, ``AllItems.aspx?id=...`` URL, or
             ``Doc.aspx?sourcedoc=...`` URL.
 
         Returns
@@ -692,13 +693,13 @@ class SharePointClient:
         >>> await client.upload_file("/sites/Team/Documents/report.xlsx", "/tmp/report.xlsx")
         """
         ...
-    def download_chunks(self, path: str) -> DownloadChunks:
+    def download_chunks(self, path: str | UUID) -> DownloadChunks:
         """Open an async context manager that streams a file's contents in chunks.
 
         Parameters
         ----------
-        path : str
-            Server-relative path, ``AllItems.aspx?id=...`` URL, or
+        path : str | UUID
+            Server-relative path, bare/braced UniqueId, ``AllItems.aspx?id=...`` URL, or
             ``Doc.aspx?sourcedoc=...`` URL.
 
         Returns
@@ -713,13 +714,13 @@ class SharePointClient:
         ...         handle(chunk)
         """
         ...
-    async def download_file(self, path: str, local_path: str) -> None:
+    async def download_file(self, path: str | UUID, local_path: str) -> None:
         """Download a SharePoint file to a local path, streaming it instead of buffering it in memory.
 
         Parameters
         ----------
-        path : str
-            Server-relative path, ``AllItems.aspx?id=...`` URL, or
+        path : str | UUID
+            Server-relative path, bare/braced UniqueId, ``AllItems.aspx?id=...`` URL, or
             ``Doc.aspx?sourcedoc=...`` URL.
         local_path : str
             Local filesystem path to write the file to.
