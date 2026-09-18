@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, RANGE, RETRY_AFTER};
+use reqwest::header::{
+    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, IF_MATCH, RANGE, RETRY_AFTER,
+};
 use reqwest::{Method, Response, StatusCode};
 use serde_json::Value;
 use tokio::runtime::Handle;
@@ -83,6 +85,20 @@ impl ClientState {
         content: Option<Vec<u8>>,
         range: Option<(u64, u64)>,
     ) -> Result<Response> {
+        self.request_with_headers(method, url, params, json_body, content, range, None)
+            .await
+    }
+
+    async fn request_with_headers(
+        &self,
+        method: Method,
+        url: &str,
+        params: Option<&[(String, String)]>,
+        json_body: Option<&Value>,
+        content: Option<Vec<u8>>,
+        range: Option<(u64, u64)>,
+        headers: Option<&HeaderMap>,
+    ) -> Result<Response> {
         let mut stale = None;
         for attempt in 0..=MAX_RETRIES {
             let (generation, token) = self.tokens.get(stale).await?;
@@ -91,6 +107,9 @@ impl ClientState {
                 .request(method.clone(), url)
                 .header(AUTHORIZATION, format!("Bearer {token}"))
                 .header(ACCEPT, "application/json;odata=nometadata");
+            if let Some(headers) = headers {
+                request = request.headers(headers.clone());
+            }
             if let Some(params) = params {
                 request = request.query(params);
             }
@@ -196,6 +215,14 @@ impl ClientState {
             .and_then(|value| value.rsplit('/').next())
             .and_then(|value| value.parse::<u64>().ok());
         Ok((response.bytes().await?.to_vec(), total))
+    }
+
+    pub async fn delete(&self, url: &str) -> Result<()> {
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_MATCH, "*".parse().expect("static header value is valid"));
+        self.request_with_headers(Method::DELETE, url, None, None, None, None, Some(&headers))
+            .await?;
+        Ok(())
     }
 }
 

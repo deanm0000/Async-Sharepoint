@@ -104,6 +104,13 @@ class SPFolder:
         >>> items = await folder.ls()
         """
         ...
+    async def del_folder(self, *, ignore_missing: bool = False, recursive: bool = False) -> None:
+        """Delete this SharePoint folder.
+
+        The folder must be empty unless ``recursive=True``. Set
+        ``ignore_missing=True`` to return successfully if it no longer exists.
+        """
+        ...
     def get_url(self) -> str:
         """Return a SharePoint browser URL for the folder.
 
@@ -209,6 +216,9 @@ class SPFile:
         --------
         >>> await file.download_file("/tmp/report.xlsx")
         """
+        ...
+    async def del_file(self) -> None:
+        """Delete this SharePoint file."""
         ...
     def get_url(self) -> str:
         """Return SharePoint's preferred URL for the file.
@@ -630,7 +640,7 @@ class SharePointClient:
         *,
         overwrite: bool = True,
     ) -> SPFile:
-        """Upload a file to a SharePoint folder.
+        """Upload a file to SharePoint, creating missing parent folders.
 
         Parameters
         ----------
@@ -655,7 +665,7 @@ class SharePointClient:
         """
         ...
     def upload_chunks(self, full_path: str, *, overwrite: bool = True) -> UploadChunks:
-        """Open an async context manager that uploads a file one chunk at a time.
+        """Upload chunks to SharePoint, creating missing parent folders.
 
         Parameters
         ----------
@@ -677,7 +687,7 @@ class SharePointClient:
         """
         ...
     async def upload_file(self, full_path: str, local_path: str, *, overwrite: bool = True) -> None:
-        """Upload a local file to a SharePoint folder, streaming it instead of buffering it in memory.
+        """Stream a local file to SharePoint, creating missing parent folders.
 
         Parameters
         ----------
@@ -748,6 +758,29 @@ class SharePointClient:
         Examples
         --------
         >>> folder = await client.add_folder("/sites/Team/Documents/Reports")
+        """
+        ...
+    async def del_file(self, path: str | UUID) -> None:
+        """Delete a SharePoint file by path, browser URL, or UniqueId."""
+        ...
+    async def del_folder(
+        self,
+        path: str,
+        *,
+        ignore_missing: bool = False,
+        recursive: bool = False,
+    ) -> None:
+        """Delete a SharePoint folder.
+
+        Parameters
+        ----------
+        path : str
+            Server-relative folder path or ``AllItems.aspx?id=...`` URL.
+        ignore_missing : bool, optional
+            Return successfully when the folder does not exist.
+        recursive : bool, optional
+            Delete the folder and all descendants. By default, only empty
+            folders can be deleted.
         """
         ...
     async def get_current_user(self) -> dict[str, Any]:

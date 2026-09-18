@@ -226,7 +226,24 @@ print(uploaded.properties["ServerRelativeUrl"])
 ```
 
 Set `overwrite=False` on `upload()` to reject an existing filename. `add_folder()` also accepts
-`overwrite=True` when an existing folder should be accepted.
+`overwrite=True` when an existing folder should be accepted. `upload()`, `upload_file()`, and
+`upload_chunks()` automatically create any missing parent folders in the destination path.
+
+Delete files from either the client or an `SPFile`:
+
+```python
+await client.del_file("/sites/Team/Documents/Exports/results.csv")
+await uploaded.del_file()
+```
+
+Folder deletion is non-recursive by default and rejects a nonempty folder. Pass `recursive=True`
+to delete all descendants, or `ignore_missing=True` when an absent folder is acceptable:
+
+```python
+await folder.del_folder()
+await client.del_folder("/sites/Team/Documents/Exports", recursive=True)
+await client.del_folder("/sites/Team/Documents/AlreadyGone", ignore_missing=True)
+```
 
 ### Streaming uploads
 

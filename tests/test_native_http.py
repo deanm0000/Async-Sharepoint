@@ -13,6 +13,9 @@ from async_sharepoint import SharePointClient, SPFile, SPFolder
 class SharePointHandler(BaseHTTPRequestHandler):
     base_url = ""
     requests: list[tuple[str, str, bytes]] = []
+    folders: set[str] = set()
+    files: set[str] = set()
+    folder_add_attempts: list[str] = []
 
     def log_message(self, format: str, *args: object) -> None:
         pass
@@ -50,6 +53,41 @@ class SharePointHandler(BaseHTTPRequestHandler):
                     "ServerRedirectedEmbedUri": (f"{self.base_url}/sites/team/Documents/report.txt?action=interactive"),
                 }
             )
+        elif "/GetFolderByServerRelativePath(" in path and path.endswith("/Files"):
+            server_relative_url = path.split("DecodedUrl='", 1)[1].split("')", 1)[0]
+            prefix = f"{server_relative_url}/"
+            self.send_json(
+                {
+                    "value": [
+                        {"ServerRelativeUrl": candidate}
+                        for candidate in self.files
+                        if candidate.startswith(prefix) and "/" not in candidate[len(prefix) :]
+                    ]
+                }
+            )
+        elif "/GetFolderByServerRelativePath(" in path and path.endswith("/Folders"):
+            server_relative_url = path.split("DecodedUrl='", 1)[1].split("')", 1)[0]
+            prefix = f"{server_relative_url}/"
+            self.send_json(
+                {
+                    "value": [
+                        {"ServerRelativeUrl": candidate}
+                        for candidate in self.folders
+                        if candidate.startswith(prefix) and "/" not in candidate[len(prefix) :]
+                    ]
+                }
+            )
+        elif "/GetFolderByServerRelativePath(" in path:
+            server_relative_url = path.split("DecodedUrl='", 1)[1].rsplit("')", 1)[0]
+            if server_relative_url not in self.folders:
+                self.send_json({"error": "File Not Found."}, status=404)
+            else:
+                prefix = f"{server_relative_url}/"
+                item_count = sum(
+                    candidate.startswith(prefix) and "/" not in candidate[len(prefix) :]
+                    for candidate in self.folders | self.files
+                )
+                self.send_json({"ServerRelativeUrl": server_relative_url, "ItemCount": item_count})
         elif "/GetFileByServerRelativePath(" in path and not path.endswith("/$value"):
             server_relative_url = path.split("DecodedUrl='", 1)[1].rsplit("')", 1)[0]
             self.send_json(
@@ -131,16 +169,59 @@ class SharePointHandler(BaseHTTPRequestHandler):
                     }
                 )
         elif "/Files/add(" in path:
-            self.send_json({"ServerRelativeUrl": "/sites/team/Documents/upload.txt"})
+            folder_path = path.split("GetFolderByServerRelativeUrl('", 1)[1].split("')", 1)[0]
+            if folder_path not in self.folders:
+                self.send_json({"error": "File Not Found."}, status=404)
+                return
+            filename = path.split("Files/add(url='", 1)[1].split("'", 1)[0]
+            file_path = f"{folder_path}/{filename}"
+            self.files.add(file_path)
+            self.send_json({"ServerRelativeUrl": file_path})
         elif "/startUpload(" in path or "/continueUpload(" in path:
             self.send_json({})
         elif "/finishUpload(" in path:
             self.send_json({"ServerRelativeUrl": "/sites/team/Documents/large.bin"})
         elif "/Folders/AddUsingPath(" in path:
             assert self.headers["Content-Length"] == "0"
-            self.send_json({"ServerRelativeUrl": "/sites/team/Documents/New"})
+            folder_path = path.split("DecodedUrl='", 1)[1].split("'", 1)[0]
+            self.folder_add_attempts.append(folder_path)
+            if folder_path in self.folders:
+                self.send_json({"error": "Folder already exists."}, status=409)
+                return
+            parent_path = folder_path.rsplit("/", 1)[0]
+            if parent_path not in self.folders:
+                self.send_json({"error": "File Not Found."}, status=404)
+                return
+            self.folders.add(folder_path)
+            self.send_json({"ServerRelativeUrl": folder_path})
         elif "/GetUserEffectivePermissions(" in path:
             self.send_json({"High": "16", "Low": "0"})
+        else:
+            self.send_json({"error": path}, status=404)
+
+    def do_DELETE(self) -> None:
+        path, _ = self.record()
+        assert self.headers["If-Match"] == "*"
+        if "/GetFolderByServerRelativePath(" in path:
+            folder_path = path.split("DecodedUrl='", 1)[1].rsplit("')", 1)[0]
+            if folder_path not in self.folders:
+                self.send_json({"error": "File Not Found."}, status=404)
+                return
+            prefix = f"{folder_path}/"
+            if any(candidate.startswith(prefix) for candidate in self.folders | self.files):
+                self.send_json({"error": "Folder is not empty."}, status=500)
+                return
+            self.folders.remove(folder_path)
+            self.send_response(204)
+            self.end_headers()
+        elif "/GetFileByServerRelativePath(" in path:
+            file_path = path.split("DecodedUrl='", 1)[1].rsplit("')", 1)[0]
+            if file_path not in self.files:
+                self.send_json({"error": "File Not Found."}, status=404)
+                return
+            self.files.remove(file_path)
+            self.send_response(204)
+            self.end_headers()
         else:
             self.send_json({"error": path}, status=404)
 
@@ -150,6 +231,12 @@ def sharepoint_server() -> Iterator[str]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), SharePointHandler)
     SharePointHandler.base_url = f"http://127.0.0.1:{server.server_port}"
     SharePointHandler.requests = []
+    SharePointHandler.folders = {
+        "/sites/team/Documents",
+        "/sites/team/Documents/Folder",
+    }
+    SharePointHandler.files = {"/sites/team/Documents/report.txt"}
+    SharePointHandler.folder_add_attempts = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -266,3 +353,46 @@ async def test_chunked_and_file_helpers(tmp_path) -> None:
             local_upload = tmp_path / "to_upload.bin"
             local_upload.write_bytes(b"y" * (8 * 1024 * 1024 + 1))
             assert await client.upload_file("/sites/team/Documents/upload_from_file.bin", str(local_upload)) is None
+
+
+@pytest.mark.asyncio
+async def test_upload_creates_missing_folders_and_delete_methods(tmp_path) -> None:
+    with sharepoint_server() as site_url:
+        async with SharePointClient.from_static_token(site_url, "test-token") as client:
+            uploaded = await client.upload("/sites/team/Documents/a/b/c/upload.txt", b"content")
+            assert uploaded.properties["ServerRelativeUrl"].endswith("/a/b/c/upload.txt")
+            assert SharePointHandler.folder_add_attempts == [
+                "/sites/team/Documents/a",
+                "/sites/team/Documents/a/b",
+                "/sites/team/Documents/a/b/c",
+            ]
+            probed_paths = {
+                unquote(urlsplit(request_path).path).split("DecodedUrl='", 1)[1].rsplit("')", 1)[0]
+                for method, request_path, _ in SharePointHandler.requests
+                if method == "GET" and "/GetFolderByServerRelativePath(" in request_path
+            }
+            assert {
+                "/sites/team/Documents",
+                "/sites/team/Documents/a",
+                "/sites/team/Documents/a/b",
+                "/sites/team/Documents/a/b/c",
+            } <= probed_paths
+            assert await uploaded.del_file() is None
+
+            local_upload = tmp_path / "local.bin"
+            local_upload.write_bytes(b"local")
+            assert await client.upload_file("/sites/team/Documents/from/file/helper.bin", str(local_upload)) is None
+            assert await client.del_file("/sites/team/Documents/from/file/helper.bin") is None
+
+            async with client.upload_chunks("/sites/team/Documents/chunked/nested/file.bin") as upload:
+                await upload.write(b"one")
+                await upload.write(b"two")
+
+            folder = await client.add_folder("/sites/team/Documents/object-folder")
+            assert await folder.del_folder() is None
+            assert await client.del_folder("/sites/team/Documents/object-folder", ignore_missing=True) is None
+
+            await client.upload("/sites/team/Documents/nonempty/child.txt", b"content")
+            with pytest.raises(RuntimeError, match="folder is not empty"):
+                await client.del_folder("/sites/team/Documents/nonempty")
+            assert await client.del_folder("/sites/team/Documents/nonempty", recursive=True) is None

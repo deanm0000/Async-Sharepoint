@@ -65,7 +65,13 @@ resolved via the file's `UniqueId`).
   `await write(chunk)` for each chunk of the upload, in order.
 - `await upload_file(full_path, local_path, *, overwrite=True)` uploads a local file in chunks
   without buffering it in memory. Returns `None`.
+
+All upload variants create missing parent folders, including multiple nested levels.
+
 - `await add_folder(path, *, overwrite=False)`
+- `await del_file(path)`
+- `await del_folder(path, *, ignore_missing=False, recursive=False)` deletes only empty folders
+  unless `recursive=True`.
 - `await get_current_user()`
 - `await get_effective_permissions(path, *, login_name=None)`
 - `await search(text, *, title=None, id=None, row_limit=6)`
@@ -75,14 +81,14 @@ resolved via the file's `UniqueId`).
 File values expose `client`, `properties`,
 `list_url`, `item_id`, `unique_id`, and `resolved` (a read-only property that is true once
 resolution has completed). Their public methods are `resolve`, `download`, `download_chunks`,
-`download_file`, `get_url`, `browser_url`, and `embed_url`. `download_chunks()` and
+`download_file`, `del_file`, `get_url`, `browser_url`, and `embed_url`. `download_chunks()` and
 `download_file(local_path)` mirror the client's methods but need no `path` argument since the
 file is already resolved.
 
 ## SPFolder
 
 Folder values expose `client`, `server_relative_url`, `properties`, `list_url`,
-`item_id`, and `resolved`. Their public methods are `resolve`, `ls`, and `get_url`.
+`item_id`, and `resolved`. Their public methods are `resolve`, `ls`, `del_folder`, and `get_url`.
 
 ## SPList
 

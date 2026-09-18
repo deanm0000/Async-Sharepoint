@@ -1,4 +1,4 @@
-use async_sharepoint_core::odata;
+use async_sharepoint_core::{Error, odata};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -7,6 +7,7 @@ use pyo3_async_runtimes::TaskLocals;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -680,6 +681,20 @@ impl SPFolder {
             .ok_or_else(|| PyRuntimeError::new_err("folder has no client"))?;
         browser_url(&client.bind(py).borrow().state.site_url, path, false)
     }
+
+    #[pyo3(signature = (*, ignore_missing=false, recursive=false))]
+    fn del_folder<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        ignore_missing: bool,
+        recursive: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (state, path) = resolve_folder(&slf).await?;
+            delete_folder_path(&state, &path, ignore_missing, recursive).await?;
+            Python::attach(|py| Ok(py.None()))
+        })
+    }
 }
 
 #[pyclass(module = "async_sharepoint")]
@@ -924,6 +939,14 @@ impl SPFile {
             let (state, path) = resolve_file(&slf).await?;
             let url = download_url(&state, FileLocator::Path(path));
             download_url_to_file(&state, &url, &local_path).await?;
+            Python::attach(|py| Ok(py.None()))
+        })
+    }
+
+    fn del_file<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (state, path) = resolve_file(&slf).await?;
+            delete_file_locator(&state, FileLocator::Path(path)).await?;
             Python::attach(|py| Ok(py.None()))
         })
     }
@@ -1248,6 +1271,177 @@ fn split_full_path(full_path: &str) -> PyResult<(String, String)> {
     }
 }
 
+fn is_not_found(error: &Error) -> bool {
+    matches!(error, Error::Http { status, .. } if status.as_u16() == 404)
+}
+
+async fn ensure_folder_path(state: &Arc<ClientState>, folder_path: &str) -> Result<(), Error> {
+    let site_path = url::Url::parse(&state.site_url)
+        .map_err(|error| Error::InvalidUrl(error.to_string()))?
+        .path()
+        .trim_end_matches('/')
+        .to_owned();
+    let relative_path = if site_path.is_empty() {
+        folder_path.trim_matches('/')
+    } else if folder_path == site_path {
+        ""
+    } else {
+        folder_path
+            .strip_prefix(&format!("{site_path}/"))
+            .ok_or_else(|| {
+                Error::InvalidUrl(format!(
+                    "folder path {folder_path} is outside site {site_path}"
+                ))
+            })?
+    };
+    let mut current = site_path;
+    let mut paths = Vec::new();
+    if !current.is_empty() {
+        paths.push(current.clone());
+    }
+    for component in relative_path
+        .split('/')
+        .filter(|component| !component.is_empty())
+    {
+        current.push('/');
+        current.push_str(component);
+        paths.push(current.clone());
+    }
+
+    let mut probes = JoinSet::new();
+    for (index, path) in paths.iter().cloned().enumerate() {
+        let state = Arc::clone(state);
+        probes.spawn(async move {
+            let url = format!(
+                "{}/GetFolderByServerRelativePath(DecodedUrl={})",
+                state.web_url,
+                odata::literal(&path)
+            );
+            (index, path, state.get_json(&url, None).await)
+        });
+    }
+
+    let mut deepest_existing = None;
+    while let Some(result) = probes.join_next().await {
+        let (index, _path, result) =
+            result.map_err(|error| Error::Unexpected(error.to_string()))?;
+        match result {
+            Ok(_) => {
+                deepest_existing =
+                    Some(deepest_existing.map_or(index, |current: usize| current.max(index)))
+            }
+            Err(error) if is_not_found(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let first_missing = deepest_existing.map(|index| index + 1).ok_or_else(|| {
+        Error::Unexpected(format!("no existing parent folder found for {folder_path}"))
+    })?;
+    for path in &paths[first_missing..] {
+        let url = format!(
+            "{}/Folders/AddUsingPath(DecodedUrl={},Overwrite=true)",
+            state.web_url,
+            odata::literal(path)
+        );
+        state.post_json(&url, None, Some(Vec::new())).await?;
+    }
+    Ok(())
+}
+
+async fn with_missing_folder_retry<T, F, Fut>(
+    state: &Arc<ClientState>,
+    folder_path: &str,
+    operation: F,
+) -> Result<T, Error>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, Error>>,
+{
+    match operation().await {
+        Err(error) if is_not_found(&error) => {
+            ensure_folder_path(state, folder_path).await?;
+            operation().await
+        }
+        result => result,
+    }
+}
+
+async fn delete_file_locator(state: &ClientState, locator: FileLocator) -> PyResult<()> {
+    let url = match locator {
+        FileLocator::Path(path) => format!(
+            "{}/GetFileByServerRelativePath(DecodedUrl={})",
+            state.web_url,
+            odata::literal(&path)
+        ),
+        FileLocator::Id(id) => format!("{}/GetFileById(guid'{}')", state.web_url, id),
+    };
+    state.delete(&url).await?;
+    Ok(())
+}
+
+async fn delete_folder_path(
+    state: &Arc<ClientState>,
+    path: &str,
+    ignore_missing: bool,
+    recursive: bool,
+) -> PyResult<()> {
+    let url = format!(
+        "{}/GetFolderByServerRelativePath(DecodedUrl={})",
+        state.web_url,
+        odata::literal(path)
+    );
+    let data = match state.get_json(&url, None).await {
+        Ok(data) => data,
+        Err(error) if ignore_missing && is_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !recursive {
+        if data.get("ItemCount").and_then(Value::as_i64).unwrap_or(0) > 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "folder is not empty: {path}; pass recursive=True to delete it"
+            )));
+        }
+        state.delete(&url).await?;
+        return Ok(());
+    }
+
+    let mut pending = vec![path.to_owned()];
+    let mut folders = Vec::new();
+    while let Some(folder_path) = pending.pop() {
+        let folder_url = format!(
+            "{}/GetFolderByServerRelativePath(DecodedUrl={})",
+            state.web_url,
+            odata::literal(&folder_path)
+        );
+        let params = Some(vec![("$select".to_owned(), "ServerRelativeUrl".to_owned())]);
+        let (files, children) = tokio::try_join!(
+            fetch_all(
+                Arc::clone(state),
+                format!("{folder_url}/Files"),
+                params.clone()
+            ),
+            fetch_all(Arc::clone(state), format!("{folder_url}/Folders"), params)
+        )?;
+        for file in files {
+            let file_path = odata::string(&file, "ServerRelativeUrl").ok_or_else(|| {
+                PyRuntimeError::new_err("SharePoint file response has no ServerRelativeUrl")
+            })?;
+            delete_file_locator(state, FileLocator::Path(file_path)).await?;
+        }
+        for child in children {
+            let child_path = odata::string(&child, "ServerRelativeUrl").ok_or_else(|| {
+                PyRuntimeError::new_err("SharePoint folder response has no ServerRelativeUrl")
+            })?;
+            pending.push(child_path);
+        }
+        folders.push(folder_url);
+    }
+    for folder_url in folders.into_iter().rev() {
+        state.delete(&folder_url).await?;
+    }
+    Ok(())
+}
+
 fn download_url(state: &ClientState, locator: FileLocator) -> String {
     match locator {
         FileLocator::Path(path) => format!(
@@ -1263,8 +1457,8 @@ async fn chunked_upload_add(
     state: &ClientState,
     add_url: &str,
     content: Vec<u8>,
-) -> PyResult<Value> {
-    Ok(state.post_json(add_url, None, Some(content)).await?)
+) -> Result<Value, Error> {
+    state.post_json(add_url, None, Some(content)).await
 }
 
 async fn chunked_upload_start(
@@ -1273,7 +1467,7 @@ async fn chunked_upload_start(
     file_url: &str,
     upload_id: &str,
     chunk: Vec<u8>,
-) -> PyResult<usize> {
+) -> Result<usize, Error> {
     state.post_json(add_url, None, Some(Vec::new())).await?;
     let len = chunk.len();
     state
@@ -1295,7 +1489,7 @@ async fn chunked_upload_continue(
     upload_id: &str,
     position: usize,
     chunk: Vec<u8>,
-) -> PyResult<usize> {
+) -> Result<usize, Error> {
     let len = chunk.len();
     state
         .post_json(
@@ -1316,8 +1510,8 @@ async fn chunked_upload_finish(
     upload_id: &str,
     position: usize,
     chunk: Vec<u8>,
-) -> PyResult<Value> {
-    Ok(state
+) -> Result<Value, Error> {
+    state
         .post_json(
             &format!(
                 "{file_url}/finishUpload(uploadID={},fileOffset={position})",
@@ -1326,7 +1520,7 @@ async fn chunked_upload_finish(
             None,
             Some(chunk),
         )
-        .await?)
+        .await
 }
 
 async fn download_url_to_file(state: &ClientState, url: &str, local_path: &str) -> PyResult<()> {
@@ -1353,7 +1547,8 @@ async fn download_url_to_file(state: &ClientState, url: &str, local_path: &str) 
 }
 
 async fn upload_file_to_folder(
-    state: &ClientState,
+    state: &Arc<ClientState>,
+    folder_path: &str,
     folder_url: &str,
     filename: &str,
     overwrite: bool,
@@ -1384,8 +1579,10 @@ async fn upload_file_to_folder(
                     chunked_upload_continue(state, &file_url, &upload_id, position, previous)
                         .await?;
             } else {
-                position =
-                    chunked_upload_start(state, &add_url, &file_url, &upload_id, previous).await?;
+                position = with_missing_folder_retry(state, folder_path, || {
+                    chunked_upload_start(state, &add_url, &file_url, &upload_id, previous.clone())
+                })
+                .await?;
                 started = true;
             }
         }
@@ -1395,10 +1592,16 @@ async fn upload_file_to_folder(
             chunked_upload_finish(state, &file_url, &upload_id, position, chunk).await?;
         }
         Some(chunk) => {
-            chunked_upload_add(state, &add_url, chunk).await?;
+            with_missing_folder_retry(state, folder_path, || {
+                chunked_upload_add(state, &add_url, chunk.clone())
+            })
+            .await?;
         }
         None => {
-            chunked_upload_add(state, &add_url, Vec::new()).await?;
+            with_missing_folder_retry(state, folder_path, || {
+                chunked_upload_add(state, &add_url, Vec::new())
+            })
+            .await?;
         }
     }
     Ok(())
@@ -1410,6 +1613,7 @@ async fn upload_file_to_folder(
 #[pyclass(module = "async_sharepoint")]
 struct UploadChunks {
     state: Arc<ClientState>,
+    folder_path: String,
     add_url: String,
     file_url: String,
     upload_id: String,
@@ -1432,12 +1636,13 @@ impl UploadChunks {
     ) -> PyResult<Bound<'py, PyAny>> {
         let chunk = chunk.as_bytes().to_vec();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let (state, add_url, file_url, upload_id, position, started, previous) =
+            let (state, folder_path, add_url, file_url, upload_id, position, started, previous) =
                 Python::attach(|py| {
                     let mut session = slf.bind(py).borrow_mut();
                     let previous = session.pending.replace(chunk);
                     (
                         Arc::clone(&session.state),
+                        session.folder_path.clone(),
                         session.add_url.clone(),
                         session.file_url.clone(),
                         session.upload_id.clone(),
@@ -1452,7 +1657,10 @@ impl UploadChunks {
             let new_position = if started {
                 chunked_upload_continue(&state, &file_url, &upload_id, position, previous).await?
             } else {
-                chunked_upload_start(&state, &add_url, &file_url, &upload_id, previous).await?
+                with_missing_folder_retry(&state, &folder_path, || {
+                    chunked_upload_start(&state, &add_url, &file_url, &upload_id, previous.clone())
+                })
+                .await?
             };
             Python::attach(|py| {
                 let mut session = slf.bind(py).borrow_mut();
@@ -1472,6 +1680,7 @@ impl UploadChunks {
     ) -> PyResult<Bound<'py, PyAny>> {
         let has_exception = !exc_type.is_none(py);
         let state = Arc::clone(&self.state);
+        let folder_path = self.folder_path.clone();
         let add_url = self.add_url.clone();
         let file_url = self.file_url.clone();
         let upload_id = self.upload_id.clone();
@@ -1488,10 +1697,16 @@ impl UploadChunks {
                     chunked_upload_finish(&state, &file_url, &upload_id, position, chunk).await?;
                 }
                 Some(chunk) => {
-                    chunked_upload_add(&state, &add_url, chunk).await?;
+                    with_missing_folder_retry(&state, &folder_path, || {
+                        chunked_upload_add(&state, &add_url, chunk.clone())
+                    })
+                    .await?;
                 }
                 None if !started => {
-                    chunked_upload_add(&state, &add_url, Vec::new()).await?;
+                    with_missing_folder_retry(&state, &folder_path, || {
+                        chunked_upload_add(&state, &add_url, Vec::new())
+                    })
+                    .await?;
                 }
                 None => {}
             }
@@ -1909,17 +2124,23 @@ impl SharePointClient {
                 odata::bool_literal(overwrite)
             );
             let data = if content.len() <= UPLOAD_CHUNK_SIZE {
-                chunked_upload_add(&state, &add_url, content).await?
+                with_missing_folder_retry(&state, &folder_path, || {
+                    chunked_upload_add(&state, &add_url, content.clone())
+                })
+                .await?
             } else {
                 let file_url = format!("{folder_url}/Files({})", odata::literal(&filename));
                 let upload_id = uuid::Uuid::new_v4().to_string();
-                let mut position = chunked_upload_start(
-                    &state,
-                    &add_url,
-                    &file_url,
-                    &upload_id,
-                    content[..UPLOAD_CHUNK_SIZE].to_vec(),
-                )
+                let first_chunk = content[..UPLOAD_CHUNK_SIZE].to_vec();
+                let mut position = with_missing_folder_retry(&state, &folder_path, || {
+                    chunked_upload_start(
+                        &state,
+                        &add_url,
+                        &file_url,
+                        &upload_id,
+                        first_chunk.clone(),
+                    )
+                })
                 .await?;
                 loop {
                     let end = (position + UPLOAD_CHUNK_SIZE).min(content.len());
@@ -1992,6 +2213,7 @@ impl SharePointClient {
             py,
             UploadChunks {
                 state: Arc::clone(&self.state),
+                folder_path,
                 add_url,
                 file_url,
                 upload_id: uuid::Uuid::new_v4().to_string(),
@@ -2021,7 +2243,15 @@ impl SharePointClient {
                 state.web_url,
                 odata::literal(&folder_path)
             );
-            upload_file_to_folder(&state, &folder_url, &filename, overwrite, &local_path).await?;
+            upload_file_to_folder(
+                &state,
+                &folder_path,
+                &folder_url,
+                &filename,
+                overwrite,
+                &local_path,
+            )
+            .await?;
             Python::attach(|py| Ok(py.None()))
         })
     }
@@ -2057,6 +2287,35 @@ impl SharePointClient {
                     },
                 )
             })
+        })
+    }
+
+    fn del_file<'py>(
+        &self,
+        py: Python<'py>,
+        path: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let state = Arc::clone(&self.state);
+        let locator = file_locator_from_py(&path)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            delete_file_locator(&state, locator).await?;
+            Python::attach(|py| Ok(py.None()))
+        })
+    }
+
+    #[pyo3(signature = (path, *, ignore_missing=false, recursive=false))]
+    fn del_folder<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        ignore_missing: bool,
+        recursive: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let state = Arc::clone(&self.state);
+        let path = browser_path(&path)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            delete_folder_path(&state, &path, ignore_missing, recursive).await?;
+            Python::attach(|py| Ok(py.None()))
         })
     }
 
