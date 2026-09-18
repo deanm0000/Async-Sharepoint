@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "async-sharepoint"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "async-sharepoint-python"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-sharepoint",
  "percent-encoding",
